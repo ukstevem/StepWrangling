@@ -1,0 +1,14 @@
+```gitignore
+__pycache__/
+*.pyc
+*.bak
+.DS_Store
+*.step
+data/output/
+.ipynb_checkpoints/
+.en
+debugimage/
+debugnc/
+ocsju/
+previews/
+training_data/

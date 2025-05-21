@@ -1,0 +1,5 @@
+numpy
+pythonocc-core
+pyvista
+matplotlib
+jupyterlab
