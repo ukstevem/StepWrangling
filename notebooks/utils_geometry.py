@@ -256,6 +256,50 @@ def get_face_area(face):
     brepgprop.SurfaceProperties(face, props)
     return props.Mass()
 
+import numpy as np
+
+
+
+
+def should_flip_zaxis_for_angle(corners_3d, xaxis, yaxis, origin):
+    """
+    For EA or UEA profiles, determine if Z axis needs to be flipped based on corner orientation.
+    Evaluates whether the section's bottom-left corner lies in the expected quadrant.
+
+    Parameters:
+        corners_3d: list of gp_Pnt from the section face
+        xaxis, yaxis: gp_Vec (local axes)
+        origin: gp_Pnt (local origin of the section)
+
+    Returns:
+        True if Z axis should be flipped, False otherwise
+    """
+    origin_np = np.array([origin.X(), origin.Y(), origin.Z()])
+    local_x = np.array([xaxis.X(), xaxis.Y(), xaxis.Z()])
+    local_y = np.array([yaxis.X(), yaxis.Y(), yaxis.Z()])
+
+    pts_2d = []
+    for pt in corners_3d:
+        vec = np.array([pt.X(), pt.Y(), pt.Z()]) - origin_np
+        px = np.dot(vec, local_x)
+        py = np.dot(vec, local_y)
+        pts_2d.append((px, py))
+
+    # Find bounding box of the section in 2D
+    xs = [p[0] for p in pts_2d]
+    ys = [p[1] for p in pts_2d]
+    min_x = min(xs)
+    min_y = min(ys)
+
+    # Check if any point is very close to the bottom-left corner (expected V origin)
+    tolerance = 1e-3
+    for px, py in pts_2d:
+        if abs(px - min_x) < tolerance and abs(py - min_y) < tolerance:
+            return False  # Correctly oriented
+
+    return True  # Bottom-left corner not found, likely flipped
+
+
 
 
 def should_flip_zaxis_for_uea(corners_3d, xaxis, yaxis, origin, matched_profile):

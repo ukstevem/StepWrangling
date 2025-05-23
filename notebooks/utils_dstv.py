@@ -1,4 +1,5 @@
 from OCC.Core.gp import gp_Pnt, gp_Vec
+from utils_visualization import make_face
 
 def compute_dstv_origins_and_axes_from_section(ordered_corners, xaxis, yaxis, zaxis):
     """
@@ -134,3 +135,56 @@ def visualize_dstv_origins(display, origins, face_axes, axis_length=40):
         display.DisplayShape(edge_y, color='GREEN', update=False)
 
     display.FitAll()
+
+def get_dstv_face_axes(profile_type, xaxis, yaxis, zaxis):
+    """
+    Maps OBB axes to DSTV face axes based on profile type.
+
+    Returns a dictionary of vectors: {'U': ..., 'V': ..., 'O': ...}
+    """
+    # Default mapping for most profiles
+    axis_u = -xaxis  # U face (side or bottom)
+    axis_v = yaxis  # V face (top)
+    axis_o = -zaxis  # O face (start/back)
+
+    # Special case for L profiles (angle steel)
+    if profile_type == "L":
+        axis_u = xaxis  # L leg pointing +X = U face
+        axis_v = yaxis  # vertical leg = V face
+
+    return {"U": axis_u, "V": axis_v, "O": axis_o}
+
+def draw_dstv_faces(display, center, he_X, he_Y, he_Z, xaxis, yaxis, zaxis, profile_type, offset=1.0):
+    """
+    Shades the DSTV U, V, and START (O) faces based on classified profile and aligned OBB axes.
+    """
+    from OCC.Core.gp import gp_Pnt
+
+    offset = 10
+
+    # Get DSTV face direction vectors based on profile
+    face_axes = get_dstv_face_axes(profile_type, xaxis, yaxis, zaxis)
+
+    # Compute origin of START face (center - Z)
+    origin_o = [
+        center.X() + face_axes["O"].Coord(1) * -he_Z,
+        center.Y() + face_axes["O"].Coord(2) * -he_Z,
+        center.Z() + face_axes["O"].Coord(3) * -he_Z
+    ]
+
+    # Compute U and V face origins offset from O face origin
+    origin_u = [
+        origin_o[i] + face_axes["U"].Coord(i + 1) * he_X for i in range(3)
+    ]
+    origin_v = [
+        origin_o[i] + face_axes["V"].Coord(i + 1) * he_Y for i in range(3)
+    ]
+
+    # Create and display the faces
+    face_start = make_face(origin_o, xaxis, yaxis, he_X, he_Y, face_axes["O"], offset)
+    face_u = make_face(origin_u, yaxis, zaxis, he_Y, he_Z, face_axes["U"], offset)
+    face_v = make_face(origin_v, xaxis, zaxis, he_X, he_Z, face_axes["V"], offset)
+
+    display.DisplayShape(face_start, color="RED", transparency=0.7, update=False)   # START face
+    display.DisplayShape(face_u, color="GREEN", transparency=0.7, update=False)     # U face
+    display.DisplayShape(face_v, color="BLUE", transparency=0.7, update=True)       # V face

@@ -75,37 +75,46 @@ def classify_profile(cs, json_path, tol_dim=1.0, tol_area=0.05):
     else:
         return None
 
-# Only checks with x and y one way
-# def classify_profile(cs, json_path, tol_dim=1.0, tol_area=0.05):
-#     # cs already contains cs['span_flange'], cs['span_web'], cs['area'], cs['length']
-#     with open(json_path) as f:
-#         lib = json.load(f)
-#     best, best_score = None, float('inf')
-#     for cat, ents in lib.items():
-#         for name, info in ents.items():
-#             dh = abs(cs['span_web'] - info['height'])
-#             dw = abs(cs['span_flange']    - info['width'])
-#             if dh > tol_dim or dw > tol_dim: 
-#                 continue
-#             ea = abs(cs['area'] - info['csa'])/info['csa']
-#             if ea > tol_area: 
-#                 continue
-#             el = abs(cs['length'] - info.get('length', cs['length']))/info.get('length', cs['length'])
-#             score = dh + dw + ea*100 + el*100
-#             if score < best_score:
-#                 best_score = score
-#                 best = {
-#                   **info,
-#                   "Designation":     name,
-#                   "Category":        cat,
-#                   "Measured_height": cs['span_web'],
-#                   "Measured_width":  cs['span_flange'],
-#                   "Measured_area":   cs['area'],
-#                   "Measured_length": cs['length'],
-#                   "Match_score":     score,
-#                   "Profile_type":    cs.get("profile_type", "Unknown")
-#                 }    
-#     return best
+def get_aligned_axes_from_profile(obb_data, matched_profile):
+    """
+    Returns the local X, Y, Z gp_Vec directions aligned with DSTV logic:
+    - Z: along the length (beam direction) — cutting starts at −Z
+    - Y: along the height (flange height)
+    - X: along the width (flange thickness or web width)
 
-# # cs = compute_section_and_length_and_origin(solid)
-# # profile = classify_profile(cs, "Shape_classifier_info.json")
+    Returns:
+        dict: {"x": gp_Vec, "y": gp_Vec, "z": gp_Vec}
+    """
+    from OCC.Core.gp import gp_Vec
+
+    axes = {
+        "X": obb_data["xaxis"],
+        "Y": obb_data["yaxis"],
+        "Z": obb_data["zaxis"],
+    }
+    half_extents = {
+        "X": obb_data["he_X"],
+        "Y": obb_data["he_Y"],
+        "Z": obb_data["he_Z"],
+    }
+    obb_dims = {k: 2 * v for k, v in half_extents.items()}
+
+    try:
+        expected_height = float(matched_profile["height"])
+        expected_width = float(matched_profile["width"])
+    except KeyError:
+        raise ValueError("Matched profile must include 'height' and 'width'")
+
+    # Match height → Y axis, width → X axis
+    y_key = min(obb_dims, key=lambda k: abs(obb_dims[k] - expected_height))
+    x_key = min(
+        (k for k in obb_dims if k != y_key),
+        key=lambda k: abs(obb_dims[k] - expected_width)
+    )
+    z_key = ({'X', 'Y', 'Z'} - {x_key, y_key}).pop()
+
+    return {
+        "x": axes[x_key],
+        "y": axes[y_key],
+        "z": axes[z_key].Reversed()  # Z points in negative beam direction
+    }
