@@ -42,14 +42,16 @@ def make_section_face_at_start(solid, center, zaxis, half_length):
 def compute_obb_and_local_axes(solid):
     from OCC.Core.Bnd import Bnd_OBB
     from OCC.Core.BRepBndLib import brepbndlib
-    from OCC.Core.gp import gp_Vec
+    from OCC.Core.gp import gp_XYZ, gp_Vec, gp_Dir, gp_Pnt, gp_Ax3
+    import numpy as np
 
     # Compute OBB
     obb = Bnd_OBB()
     brepbndlib.AddOBB(solid, obb, True, True, False)
 
     # Get raw data
-    center = obb.Center()
+    center_xyz: gp_XYZ = obb.Center()
+    center = gp_Pnt(center_xyz)
     axes = [obb.XDirection(), obb.YDirection(), obb.ZDirection()]
     half_extents = [obb.XHSize(), obb.YHSize(), obb.ZHSize()]
 
@@ -66,8 +68,30 @@ def compute_obb_and_local_axes(solid):
     he_Y = half_extents[flange_idx]
     he_Z = half_extents[length_idx]
 
+    # Convert to directions
+    xdir = gp_Dir(xaxis)
+    ydir = gp_Dir(yaxis)
+    zdir = gp_Dir(zaxis)
+
+    # --- DEBUG PRINTS ---
+    print("center           :", center,           "type:", type(center))
+    print("raw_axes[wi]     :", axes,     "type:", type(axes))
+    print("xaxis_vec        :", xaxis,        "type:", type(xaxis))
+    print("xaxis_dir        :", xdir,        "type:", type(xdir))
+    print("zaxis_vec        :", zaxis,        "type:", type(zaxis))
+    print("zaxis_dir        :", zdir,        "type:", type(zdir))
+    print("extents sorted   :", web_idx, flange_idx, length_idx)
+    print("half-extents     :", (he_X, he_Y, he_Z))
+    # --------------------
+
+    # Build local coordinate system (Ax3)
+    # 6) Build the local coordinate system (Ax3)
+    #    Origin = center point, Z = zdir, X = xdir
+    local_cs = gp_Ax3(center, zdir, xdir)
+    
     return {
         'center': center,
+        'center_XYZ': center_xyz,
         'xaxis': xaxis,
         'yaxis': yaxis,
         'zaxis': zaxis,
@@ -75,7 +99,11 @@ def compute_obb_and_local_axes(solid):
         'he_Y': he_Y,
         'he_Z': he_Z,
         'axes': (xaxis, yaxis, zaxis),
-        'half_extents': (he_X, he_Y, he_Z)
+        'half_extents': (he_X, he_Y, he_Z),
+        'xaxis_dir': xdir,
+        'yaxis_dir': ydir,
+        'zaxis_dir': zdir,
+        'local_cs': local_cs
     }
 
 def cut_section_area(solid, origin, normal):
@@ -386,3 +414,197 @@ def extract_ordered_section_corners(face, xaxis, yaxis, origin, expected=4):
     ordered_pts_3d = [pt3d for _, pt3d in indexed[:expected]]
 
     return ordered_pts_3d
+
+
+def transform_point_to_local(point, obb_data):
+    """
+    Transforms a 3D point from global to OBB-local coordinates.
+    """
+    origin = np.array([obb_data['center'].X(), obb_data['center'].Y(), obb_data['center'].Z()])
+    x_axis = np.array([obb_data['xaxis'].X(), obb_data['xaxis'].Y(), obb_data['xaxis'].Z()])
+    y_axis = np.array([obb_data['yaxis'].X(), obb_data['yaxis'].Y(), obb_data['yaxis'].Z()])
+    z_axis = np.array([obb_data['zaxis'].X(), obb_data['zaxis'].Y(), obb_data['zaxis'].Z()])
+    R = np.vstack([x_axis, y_axis, z_axis]).T  # 3x3 rotation matrix (columns are axis directions)
+
+    local = np.dot(R.T, (point - origin))  # Rotate and translate into local space
+    return local
+
+# import numpy as np
+# import pandas as pd
+# from OCC.Core.TopExp import TopExp_Explorer
+# from OCC.Core.TopAbs import TopAbs_FACE
+# from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
+# from OCC.Core.GeomAbs import GeomAbs_Cylinder
+
+# def transform_point_to_local(point, obb_data):
+#     origin = np.array([obb_data['center'].X(), obb_data['center'].Y(), obb_data['center'].Z()])
+#     x = np.array([obb_data['xaxis'].X(), obb_data['xaxis'].Y(), obb_data['xaxis'].Z()])
+#     y = np.array([obb_data['yaxis'].X(), obb_data['yaxis'].Y(), obb_data['yaxis'].Z()])
+#     x = x / np.linalg.norm(x)
+#     y = y / np.linalg.norm(y)
+#     z = np.cross(x, y)
+#     z = z / np.linalg.norm(z)
+#     R = np.vstack([x, y, z]).T
+#     return np.dot(R.T, point - origin)
+
+# def transform_vector_to_local(vec, obb_data):
+#     x = np.array([obb_data['xaxis'].X(), obb_data['xaxis'].Y(), obb_data['xaxis'].Z()])
+#     y = np.array([obb_data['yaxis'].X(), obb_data['yaxis'].Y(), obb_data['yaxis'].Z()])
+#     x = x / np.linalg.norm(x)
+#     y = y / np.linalg.norm(y)
+#     z = np.cross(x, y)
+#     z = z / np.linalg.norm(z)
+#     R = np.vstack([x, y, z]).T
+#     return np.dot(R.T, vec)
+
+# def extract_cylinders_local(solid, obb_data):
+#     explorer = TopExp_Explorer(solid, TopAbs_FACE)
+#     data = []
+
+#     while explorer.More():
+#         face = explorer.Current()
+#         surf = BRepAdaptor_Surface(face)
+
+#         if surf.GetType() == GeomAbs_Cylinder:
+#             cyl = surf.Cylinder()
+
+#             center_global = np.array([
+#                 cyl.Axis().Location().X(),
+#                 cyl.Axis().Location().Y(),
+#                 cyl.Axis().Location().Z()
+#             ])
+#             dir_global = np.array([
+#                 cyl.Axis().Direction().X(),
+#                 cyl.Axis().Direction().Y(),
+#                 cyl.Axis().Direction().Z()
+#             ])
+
+#             center_local = transform_point_to_local(center_global, obb_data)
+#             axis_local = transform_vector_to_local(dir_global, obb_data)
+
+#             radius = cyl.Radius()
+#             diameter = 2 * radius
+#             length_estimate = 1000.0  # placeholder — real length requires edge traversal
+
+#             data.append({
+#                 "X (mm)": center_local[0],
+#                 "Y (mm)": center_local[1],
+#                 "Z (mm)": center_local[2],
+#                 "Diameter (mm)": diameter,
+#                 "Length (est mm)": length_estimate,
+#                 "Axis X": axis_local[0],
+#                 "Axis Y": axis_local[1],
+#                 "Axis Z": axis_local[2]
+#             })
+
+#         explorer.Next()
+
+#     return pd.DataFrame(data)
+
+
+import pandas as pd
+from OCC.Core.TopExp import TopExp_Explorer
+from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
+from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
+from OCC.Core.GeomAbs import GeomAbs_Cylinder
+from OCC.Core.BRep import BRep_Tool
+from OCC.Core.Geom import Geom_Circle
+from OCC.Core.gp import gp_Trsf, gp_Ax3, gp_Vec, gp_Dir
+
+import pandas as pd
+from OCC.Core.TopExp         import TopExp_Explorer
+from OCC.Core.TopAbs        import TopAbs_FACE, TopAbs_EDGE
+from OCC.Core.BRepAdaptor   import BRepAdaptor_Surface
+from OCC.Core.GeomAbs       import GeomAbs_Cylinder
+from OCC.Core.BRep           import BRep_Tool
+from OCC.Core.gp            import gp_Trsf, gp_Ax3, gp_Vec
+from OCC.Core.Geom          import Geom_Circle
+
+def identify_cylindrical_holes_local(
+    solid,
+    display,
+    local_cs,
+    show_hole_marker,
+    axis_scale: float = 2.0
+) -> pd.DataFrame:
+    records = []
+    faces   = TopExp_Explorer(solid, TopAbs_FACE)
+    hole_no = 0
+    face_id = 0
+
+    # transform from global → local_cs
+    trsf = gp_Trsf()
+    trsf.SetTransformation(gp_Ax3(), local_cs)
+
+    # for deciding flip
+    local_axes_vec = {
+        'z': gp_Vec(local_cs.Direction())
+    }
+
+    while faces.More():
+        face_id += 1
+        face = faces.Current()
+
+        adaptor = BRepAdaptor_Surface(face)
+        if adaptor.GetType() == GeomAbs_Cylinder:
+            hole_no += 1
+
+            # find true circle edge
+            circ_center = circ_radius = None
+            edges = TopExp_Explorer(face, TopAbs_EDGE)
+            while edges.More():
+                edge = edges.Current()
+                try:
+                    ch, _, _ = BRep_Tool.Curve(edge)
+                    gc = Geom_Circle.DownCast(ch)
+                except Exception:
+                    gc = None
+
+                if gc:
+                    circ_center = gc.Location()
+                    circ_radius = gc.Radius()
+                    break
+                edges.Next()
+
+            if circ_center is None:
+                cyl = adaptor.Cylinder()
+                circ_center = cyl.Axis().Location()
+                circ_radius = cyl.Radius()
+
+            dia = 2.0 * circ_radius
+
+            # get and possibly flip the cylinder axis (global)
+            dir_glob = adaptor.Cylinder().Axis().Direction()
+            v_test = gp_Vec(dir_glob)
+            v_test.Transform(trsf)
+            if v_test.Dot(local_axes_vec['z']) < 0:
+                dir_glob.Reverse()
+
+            # display in GLOBAL coords
+            show_hole_marker(display, circ_center, dir_glob, circ_radius, axis_scale)
+
+            # compute local center coords for the table
+            p_loc = circ_center.Transformed(trsf)
+            x, y, z = p_loc.Coord()
+
+            # extract global-normal components
+            nx, ny, nz = dir_glob.Coord(1), dir_glob.Coord(2), dir_glob.Coord(3)
+
+            records.append({
+                'hole#':   hole_no,
+                'face_id': face_id,
+                'dia':     dia,
+                'x':       x,
+                'y':       y,
+                'z':       z,
+                'nx':      nx,
+                'ny':      ny,
+                'nz':      nz,
+            })
+
+        faces.Next()
+
+    return pd.DataFrame(records, columns=[
+        'hole#','face_id','dia','x','y','z','nx','ny','nz'
+    ])
+
