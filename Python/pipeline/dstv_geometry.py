@@ -12,98 +12,86 @@ from OCC.Core.BRepBndLib import brepbndlib
 import numpy as np
 import pandas as pd
 
-def classify_and_project_holes_dstv(solid, dstv_frame):
-    origin_dstv = dstv_frame.Location()
-    props = GProp_GProps()
-    brepgprop.VolumeProperties(solid, props)
-    cm = props.CentreOfMass()
-    centroid = np.array([cm.X(), cm.Y(), cm.Z()])
+from OCC.Core.TopExp import TopExp_Explorer
+from OCC.Core.TopAbs import TopAbs_EDGE
+from OCC.Core.TopoDS import topods
+from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
+from OCC.Core.GeomAbs import GeomAbs_Circle
+import numpy as np
+import pandas as pd
 
-    im = props.MatrixOfInertia()
-    T = np.array([[im.Value(i, j) for j in (1, 2, 3)] for i in (1, 2, 3)])
-    ev, evec = np.linalg.eigh(T)
-    order = np.argsort(ev)
-    dirs = [gp_Vec(*evec[:, i]) for i in order]
-    
+def classify_and_project_holes_dstv(solid, dstv_frame, origin_dstv, width_mm, flange_span_mm):
+    explorer = TopExp_Explorer(solid, TopAbs_EDGE)
+    edges = []
+
+    origin_np = np.array([origin_dstv.X(), origin_dstv.Y(), origin_dstv.Z()])
     L = np.array([dstv_frame.XDirection().X(), dstv_frame.XDirection().Y(), dstv_frame.XDirection().Z()])
     F = np.array([dstv_frame.YDirection().X(), dstv_frame.YDirection().Y(), dstv_frame.YDirection().Z()])
     W = np.array([dstv_frame.Direction().X(),   dstv_frame.Direction().Y(),   dstv_frame.Direction().Z()])
 
+    width_tol = 0.5 * width_mm + 10  # for V face
+    flange_tol = 15  # for U and O face distance from DSTV plane
 
-    bbox = Bnd_Box()
-    brepbndlib.Add(solid, bbox)
-    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-    spans = np.array([xmax - xmin, ymax - ymin, zmax - zmin])
-    half_extents = 0.5 * np.sort(spans)[::-1]
-    length, width, thickness = half_extents * 2
-
-    origin_nc1 = np.array([origin_dstv.X(), origin_dstv.Y(), origin_dstv.Z()])
-
-
-    tol_long = 0.7
-    tol_web = 0.7
-    hole_data = []
-    explorer = TopExp_Explorer(solid, TopAbs_FACE)
+    seen_keys = set()
+    hole_rows = []
 
     while explorer.More():
-        face = topods.Face(explorer.Current())
-        adaptor = BRepAdaptor_Surface(face, True)
-        if adaptor.GetType() == GeomAbs_Cylinder:
-            cyl = adaptor.Cylinder()
-            axis_dir = np.array([cyl.Axis().Direction().X(),
-                                 cyl.Axis().Direction().Y(),
-                                 cyl.Axis().Direction().Z()])
-            norm = np.linalg.norm(axis_dir)
-            if norm == 0:
-                explorer.Next()
-                continue
-            axis_dir /= norm
+        edge = topods.Edge(explorer.Current())
+        curve = BRepAdaptor_Curve(edge)
+        if curve.GetType() != GeomAbs_Circle:
+            explorer.Next()
+            continue
 
-            if abs(np.dot(axis_dir, L)) > tol_long:
-                explorer.Next()
-                continue
+        circ = curve.Circle()
+        center = circ.Location()
+        axis = circ.Axis().Direction()
 
-            pf = GProp_GProps()
-            brepgprop.SurfaceProperties(face, pf)
-            fc = np.array([pf.CentreOfMass().X(),
-                           pf.CentreOfMass().Y(),
-                           pf.CentreOfMass().Z()])
+        center_np = np.array([center.X(), center.Y(), center.Z()])
+        axis_np = np.array([axis.X(), axis.Y(), axis.Z()])
+        axis_np /= np.linalg.norm(axis_np)
+        radius = circ.Radius()
 
-            if abs(np.dot(axis_dir, W)) > tol_web:
-                code, rgb = "V", (1.0, 0.0, 0.0)
-            else:
-                side = np.dot(fc - centroid, F)
-                code, rgb = ("O", (0.0, 1.0, 0.0)) if side > 0 else ("U", (0.0, 0.0, 1.0))
+        v = center_np - origin_np
+        d_web = abs(np.dot(v, W))
+        d_flange = np.dot(v, F)
 
-            hole_data.append((face, code, rgb, fc))
-        explorer.Next()
+        dot_web = abs(np.dot(axis_np, W))
+        dot_flange = np.dot(axis_np, F)
 
-    rows = []
-    for idx, (face, code, rgb, fc) in enumerate(hole_data, start=1):
-        adaptor = BRepAdaptor_Surface(face, True)
-        diam = 2.0 * adaptor.Cylinder().Radius()
-        v = fc - origin_nc1
+        # Classify by proximity and direction
+        if d_web <= width_tol and dot_web > 0.7:
+            code = 'V'
+            y_axis = F
+        elif abs(d_flange) <= flange_tol and dot_flange < -0.7:
+            code = 'U'
+            y_axis = W
+        elif abs(d_flange - flange_span_mm) <= flange_tol and dot_flange > 0.7:
+            code = 'O'
+            y_axis = W
+        else:
+            explorer.Next()
+            continue
 
-        if code == "V":
-            x = abs(float(np.dot(v, L)))
-            y = abs(float(np.dot(v, F)))
-        elif code == "U":
-            x = abs(float(np.dot(v, L)))
-            y = abs(float(np.dot(v, W)))
-        elif code == "O":
-            x = abs(float(np.dot(v, L)))
-            y = abs(float(np.dot(v, W)))
+        x = round(float(np.dot(v, L)), 2)
+        y = round(float(np.dot(v, y_axis)), 2)
 
-        rows.append({
-            "Hole #":        idx,
+        key = (round(x, 1), round(y, 1), round(radius, 2), code)
+        if key in seen_keys:
+            explorer.Next()
+            continue
+        seen_keys.add(key)
+
+        hole_rows.append({
+            "Hole #":        len(hole_rows) + 1,
             "Code":          code,
-            "Diameter (mm)": round(diam, 2),
-            "X (mm)":        round(x, 2),
-            "Y (mm)":        round(y, 2)
+            "Diameter (mm)": round(radius * 2, 2),
+            "X (mm)":        x,
+            "Y (mm)":        y
         })
 
-    df_holes = pd.DataFrame(rows)
-    return df_holes, hole_data, origin_nc1, L, F, W
+        explorer.Next()
+
+    return pd.DataFrame(hole_rows)
 
 def check_duplicate_holes(df_holes, tolerance=0.1):
     """

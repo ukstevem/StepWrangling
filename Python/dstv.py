@@ -21,22 +21,24 @@ from pipeline.dstv_writer import (generate_nc1_file,
                                   create_project_directories, 
                                   assemble_dstv_header_data)
 from pipeline.drawing import generate_hole_projection_html
-from pipeline.ifc_out import export_solid_to_ifc
+from pipeline.cad_out import (export_solid_to_brep, 
+                              shape_to_thumbnail, 
+                              export_solid_to_step)
 
 from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3
 
-def dstv_pipeline(step_path, project_number, matl_grade):
+def dstv_pipeline(root_model, project_number, matl_grade):
 
     # Generate folder structure and get paths
 
     # Project Driven
-    base_path, nc_path, report_path, drawing_path, ifc_path = create_project_directories(project_number)
+    base_path, nc_path, report_path, drawing_path, cad_path, thumb_path, step_path, brep_path = create_project_directories(project_number)
 
     # Static
     media_path = "../../data/media/"
     json_path = "../../data/Shape_classifier_info.json"
 
-    solids = load_step_file(step_path)
+    solids = load_step_file(root_model)
     results = []
 
     for i, shape_orig in enumerate(solids):
@@ -44,6 +46,13 @@ def dstv_pipeline(step_path, project_number, matl_grade):
         print(f"\n🟦 Processing {member_id}...")
 
         try:
+
+            # Thumbnail
+            shape_to_thumbnail(shape_orig, thumb_path, member_id)
+            # cad output
+            # export_solid_to_brep(shape_orig, brep_path, member_id)
+            export_solid_to_step(shape_orig, step_path, member_id)
+
             # STEP 1: Align to major geometry
             primary_aligned_shape, trsf, cs, largest_face, dir_x, dir_y, dir_z = robust_align_solid_from_geometry(shape_orig)
             dir_x, dir_y, dir_z = ensure_right_handed(dir_x, dir_y, dir_z)
@@ -109,11 +118,6 @@ def dstv_pipeline(step_path, project_number, matl_grade):
             )
 
             print(f"✅ Orientation refinement complete. New extents: {obb_geom['aligned_extents']}")
-            # Export shape as ifc
-            try:
-                export_solid_to_ifc(refined_shape, f"{ifc_path}\{member_id}.ifc", name=member_id, material=matl_grade)
-            except Exception as e:
-                print(f"❌ Error in {member_id}: {e}")
 
             ## define the DSTV frame and axis direction from geometry
             dstv_frame = gp_Ax3(
@@ -125,9 +129,15 @@ def dstv_pipeline(step_path, project_number, matl_grade):
             # print(section_result_table(profile_match))
 
             # STEP 9: Classify and check holes
-            raw_df_holes, hole_data, origin_nc1, L, F, W = classify_and_project_holes_dstv(
-                refined_shape, dstv_frame
-            )
+            # raw_df_holes, hole_data, origin_nc1, L, F, W = classify_and_project_holes_dstv(
+            #     refined_shape, dstv_frame
+            # )
+            step_vals = profile_match["STEP"]
+            raw_df_holes = classify_and_project_holes_dstv(refined_shape, 
+                                                            dstv_frame,
+                                                            dstv_frame.Location(),
+                                                            step_vals["width"],
+                                                            step_vals["height"])
 
             # print(raw_df_holes)
 
@@ -135,7 +145,7 @@ def dstv_pipeline(step_path, project_number, matl_grade):
 
             # STEP 9.5: Collate DSTV header
             dstv_header_data = assemble_dstv_header_data(project_number, 
-                                                         step_path, 
+                                                         root_model, 
                                                          matl_grade, 
                                                          member_id, 
                                                          profile_match)
@@ -146,9 +156,6 @@ def dstv_pipeline(step_path, project_number, matl_grade):
             # Drawing
             generate_hole_projection_html(raw_df_holes, dstv_header_data, media_path, drawing_path)
             
-
-
-
             # results.append({
             #     "ID": member_id,
             #     "Designation": profile_match.get("designation"),
@@ -174,7 +181,8 @@ def dstv_pipeline(step_path, project_number, matl_grade):
 if __name__ == "__main__":
 
     # step_path = "../../data/C25001-1-0101.step"
-    step_path = "../../data/0444-1 ANGLED.step"
+    step_path = "../../data/MEM-026.step"
+    # step_path = "../../data/0444-1 ANGLED.step"
     # step_path = "../../data/ncTest.step"
     # step_path = "../../data/TestEA.step"
     # step_path = "../../data/TestEAMirror.step"
