@@ -110,7 +110,10 @@ def dstv_pipeline(step_path, project_number, matl_grade):
 
             print(f"✅ Orientation refinement complete. New extents: {obb_geom['aligned_extents']}")
             # Export shape as ifc
-            export_solid_to_ifc(refined_shape, f"{ifc_path}\{member_id}.ifc", member_id, matl_grade)
+            try:
+                export_solid_to_ifc(refined_shape, f"{ifc_path}\{member_id}.ifc", name=member_id, material=matl_grade)
+            except Exception as e:
+                print(f"❌ Error in {member_id}: {e}")
 
             ## define the DSTV frame and axis direction from geometry
             dstv_frame = gp_Ax3(

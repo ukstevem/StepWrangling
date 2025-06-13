@@ -3,34 +3,95 @@ import ifcopenshell.api
 from OCC.Core.BRep import BRep_Builder
 from OCC.Core.TopoDS import TopoDS_Compound
 
-def export_solid_to_ifc(solid, ifc_path, name, material):
-    # Create a new IFC file (version can be changed)
+def ensure_ok(result, msg=""):
+    if isinstance(result, str):
+        raise RuntimeError(f"{msg} → {result}")
+    return result
+
+
+import ifcopenshell
+import ifcopenshell.api
+from OCC.Core.TopoDS import TopoDS_Shape
+
+def ensure_ok(result, msg="Unknown IFC error"):
+    if isinstance(result, str):
+        raise RuntimeError(f"{msg}: {result}")
+    return result
+
+def export_solid_to_ifc(solid: TopoDS_Shape, ifc_path: str, name="Solid", material="S355JR", profile_type="UNSPECIFIED"):
+    # Create a new IFC file
     ifc = ifcopenshell.api.run("project.create_file")
 
-    # Add a project
-    project = ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcProject", name="STEP Export Project")
-    context = ifcopenshell.api.run("context.add_context", ifc, context_type="Model")
-    ifcopenshell.api.run("unit.assign_unit", ifc, length="millimetre")
+    # Create core project structure
+    project = ensure_ok(
+        ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcProject", name="STEP Export Project"),
+        "Failed to create IfcProject"
+    )
 
-    # Create a site, building, storey, and product placement
-    site = ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcSite", name="Default Site")
-    building = ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcBuilding", name="Default Building")
-    storey = ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcBuildingStorey", name="Default Storey")
-    ifcopenshell.api.run("aggregate.assign_object", ifc, product=project, relating_object=site)
-    ifcopenshell.api.run("aggregate.assign_object", ifc, product=site, relating_object=building)
-    ifcopenshell.api.run("aggregate.assign_object", ifc, product=building, relating_object=storey)
+    context = ensure_ok(
+        ifcopenshell.api.run("context.add_context", ifc, context_type="Model"),
+        "Failed to add context"
+    )
 
-    # Convert solid into IfcShapeRepresentation
-    shape = ifcopenshell.api.run("geometry.add_occ_shape", ifc, shape=solid, context=context)
+    ensure_ok(
+        ifcopenshell.api.run("unit.assign_unit", ifc, length="millimetre"),
+        "Failed to assign unit"
+    )
 
-    # Create a beam (or generic IfcBuildingElementProxy)
-    beam = ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcBeam", name=name)
-    ifcopenshell.api.run("geometry.assign_representation", ifc, product=beam, representation=shape)
-    ifcopenshell.api.run("spatial.assign_container", ifc, product=beam, relating_structure=storey)
+    # Create site > building > storey hierarchy
+    site = ensure_ok(
+        ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcSite", name="Default Site"),
+        "Failed to create IfcSite"
+    )
+    building = ensure_ok(
+        ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcBuilding", name="Default Building"),
+        "Failed to create IfcBuilding"
+    )
+    storey = ensure_ok(
+        ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcBuildingStorey", name="Default Storey"),
+        "Failed to create IfcBuildingStorey"
+    )
 
-    # Assign material if you want
-    ifcopenshell.api.run("material.assign_material", ifc, product=beam, type="IfcMaterial", name=material)
+    ensure_ok(
+        ifcopenshell.api.run("aggregate.assign_object", ifc, product=project, relating_object=site),
+        "Failed to assign site to project"
+    )
+    ensure_ok(
+        ifcopenshell.api.run("aggregate.assign_object", ifc, product=site, relating_object=building),
+        "Failed to assign building to site"
+    )
+    ensure_ok(
+        ifcopenshell.api.run("aggregate.assign_object", ifc, product=building, relating_object=storey),
+        "Failed to assign storey to building"
+    )
 
-    # Save to disk
+    # Convert OCC solid to IfcShapeRepresentation
+    shape = ensure_ok(
+        ifcopenshell.api.run("geometry.add_occ_shape", ifc, shape=solid, context=context),
+        "Failed to add shape from OCC solid"
+    )
+
+    # Create IfcBeam (or IfcBuildingElementProxy, etc.)
+    beam = ensure_ok(
+        ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcBeam", name=name),
+        "Failed to create IfcBeam"
+    )
+
+    ensure_ok(
+        ifcopenshell.api.run("geometry.assign_representation", ifc, product=beam, representation=shape),
+        "Failed to assign geometry representation"
+    )
+
+    ensure_ok(
+        ifcopenshell.api.run("spatial.assign_container", ifc, product=beam, relating_structure=storey),
+        "Failed to assign beam to storey"
+    )
+
+    ensure_ok(
+        ifcopenshell.api.run("material.assign_material", ifc, product=beam, type="IfcMaterial", name=material),
+        "Failed to assign material"
+    )
+
+    # Save IFC file
     ifc.write(ifc_path)
     print(f"✅ IFC file saved to: {ifc_path}")
