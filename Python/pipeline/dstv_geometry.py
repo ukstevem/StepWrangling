@@ -12,7 +12,8 @@ from OCC.Core.BRepBndLib import brepbndlib
 import numpy as np
 import pandas as pd
 
-def classify_and_project_holes_dstv(solid, dstv_frame, origin_dstv):
+def classify_and_project_holes_dstv(solid, dstv_frame):
+    origin_dstv = dstv_frame.Location()
     props = GProp_GProps()
     brepgprop.VolumeProperties(solid, props)
     cm = props.CentreOfMass()

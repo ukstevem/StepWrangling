@@ -4,11 +4,12 @@ from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.GProp import GProp_GProps
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
-from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Vec, gp_Ax1, gp_Ax3, gp_Trsf
-from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform
+from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Vec, gp_Ax1, gp_Ax3, gp_Trsf, gp_Pln
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform, BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.TopoDS import topods
+from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Section
 
 import numpy as np
 
@@ -136,51 +137,6 @@ def compute_obb_geometry(aligned_shape):
     }
 
 
-# def compute_section_area(shape):
-#     """
-#     Compute the surface area of a face or shell.
-#     If shape is a solid, warns user and returns 0.
-#     """
-#     if shape.ShapeType() != 4:  # 4 = TopAbs_FACE
-#         print("⚠️ Warning: compute_section_area expected a face, not a solid.")
-#         return 0
-
-#     props = GProp_GProps()
-#     face = topods.Face(shape)
-#     brepgprop.SurfaceProperties(face, props)
-#     return props.Mass()
-
-from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeFace
-from OCC.Core.GProp import GProp_GProps
-from OCC.Core.BRepGProp import brepgprop
-from OCC.Core.TopExp import TopExp_Explorer
-from OCC.Core.TopAbs import TopAbs_WIRE
-
-def compute_section_area_from_section(section_shape):
-    """
-    Compute the cross-sectional area from a section shape (wires).
-    """
-    total_area = 0.0
-
-    # Extract wires from the section
-    explorer = TopExp_Explorer(section_shape, TopAbs_WIRE)
-    while explorer.More():
-        wire = explorer.Current()
-        face_maker = BRepBuilderAPI_MakeFace(wire)
-        if face_maker.IsDone():
-            face = face_maker.Face()
-            props = GProp_GProps()
-            brepgprop.SurfaceProperties(face, props)
-            area = props.Mass()
-            total_area += area
-        explorer.Next()
-
-    if total_area == 0.0:
-        raise ValueError("❌ No valid faces created from wires — section area is zero.")
-
-    return total_area
-
-
 def compute_section_area(shape, slice_x=0.5, tol=1e-2, min_area=100, max_area=20000):
     """
     Computes the cross-sectional area of a solid by slicing at a given X,
@@ -188,15 +144,6 @@ def compute_section_area(shape, slice_x=0.5, tol=1e-2, min_area=100, max_area=20
 
     Automatically rejects invalid areas.
     """
-    from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Section
-    from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace
-    from OCC.Core.BRepGProp import brepgprop
-    from OCC.Core.GProp import GProp_GProps
-    from OCC.Core.TopExp import TopExp_Explorer
-    from OCC.Core.TopAbs import TopAbs_EDGE
-    from OCC.Core.Bnd import Bnd_Box
-    from OCC.Core.BRepBndLib import brepbndlib
-    from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Pln
 
     # Compute bounding box and slicing location
     aabb = Bnd_Box()

@@ -12,11 +12,12 @@ def create_project_directories(project_number):
     nc1_path = os.path.join(base_path, "Nc1")
     reports_path = os.path.join(base_path, "Reports")
     drawings_path = os.path.join(base_path, "Drawings")
+    ifc_path = os.path.join(base_path, "Ifc")
 
     for path in [nc1_path, reports_path, drawings_path]:
         os.makedirs(path, exist_ok=True)
 
-    return base_path, nc1_path, reports_path, drawings_path
+    return base_path, nc1_path, reports_path, drawings_path, ifc_path
 
 def assemble_dstv_header_data(project_number, step_path, matl_grade, member_id, profile_match):
     """

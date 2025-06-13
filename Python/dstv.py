@@ -7,7 +7,6 @@ from pipeline.geometry_utils import (robust_align_solid_from_geometry,
                                      ensure_right_handed, 
                                      compute_obb_geometry, 
                                      compute_section_area,
-                                     compute_section_area_from_section,
                                      swap_width_and_height_if_required,
                                      compute_dstv_origin,
                                      align_obb_to_dstv_frame,
@@ -21,8 +20,9 @@ from pipeline.dstv_geometry import (classify_and_project_holes_dstv,
 from pipeline.dstv_writer import (generate_nc1_file, 
                                   create_project_directories, 
                                   assemble_dstv_header_data)
-# from pipeline.html_drawings import generate_html_drawing
-# from pipeline.error_handling import safely_process_solid
+from pipeline.drawing import generate_hole_projection_html
+from pipeline.ifc_out import export_solid_to_ifc
+
 from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3
 
 def dstv_pipeline(step_path, project_number, matl_grade):
@@ -30,7 +30,7 @@ def dstv_pipeline(step_path, project_number, matl_grade):
     # Generate folder structure and get paths
 
     # Project Driven
-    base_path, nc_path, report_path, drawing_path = create_project_directories(project_number)
+    base_path, nc_path, report_path, drawing_path, ifc_path = create_project_directories(project_number)
 
     # Static
     media_path = "../../data/media/"
@@ -72,12 +72,12 @@ def dstv_pipeline(step_path, project_number, matl_grade):
             profile_match = classify_profile(cs_data, json_path, tol_dim=1.0, tol_area=5)
             if profile_match is None:
                 raise ValueError("❌ No matching profile found")
-            else:
-                print("✅ Match found:")
-                print(f"  → Designation: {profile_match['Designation']}")
-                print(f"  → Category: {profile_match['Category']}")
-                print(f"  → Type: {profile_match['Profile_type']}")
-                print(f"  → Requires rotation: {profile_match['Requires_rotation']}")
+            # else:
+                # print("✅ Match found:")
+                # print(f"  → Designation: {profile_match['Designation']}")
+                # print(f"  → Category: {profile_match['Category']}")
+                # print(f"  → Type: {profile_match['Profile_type']}")
+                # print(f"  → Requires rotation: {profile_match['Requires_rotation']}")
 
             # STEP 6: Adjust orientation if needed
             primary_aligned_shape, obb_geom = swap_width_and_height_if_required(
@@ -104,11 +104,13 @@ def dstv_pipeline(step_path, project_number, matl_grade):
             )
 
             # STEP 8: Final orientation refinement
-            primary_aligned_shape, obb_geom = refine_profile_orientation(
+            refined_shape, obb_geom = refine_profile_orientation(
                 primary_aligned_shape, profile_match, compute_obb_geometry(primary_aligned_shape)
             )
 
             print(f"✅ Orientation refinement complete. New extents: {obb_geom['aligned_extents']}")
+            # Export shape as ifc
+            export_solid_to_ifc(refined_shape, f"{ifc_path}\{member_id}.ifc", member_id, matl_grade)
 
             ## define the DSTV frame and axis direction from geometry
             dstv_frame = gp_Ax3(
@@ -117,14 +119,16 @@ def dstv_pipeline(step_path, project_number, matl_grade):
                 gp_Dir(obb_geom["aligned_dir_x"].XYZ())
             )
 
-            print(section_result_table(profile_match))
+            # print(section_result_table(profile_match))
 
             # STEP 9: Classify and check holes
             raw_df_holes, hole_data, origin_nc1, L, F, W = classify_and_project_holes_dstv(
-                primary_aligned_shape, dstv_frame, origin_local
+                refined_shape, dstv_frame
             )
 
-            duplicates_found, duplicate_holes = check_duplicate_holes(raw_df_holes, tolerance=0.5)
+            # print(raw_df_holes)
+
+            check_duplicate_holes(raw_df_holes, tolerance=0.5)
 
             # STEP 9.5: Collate DSTV header
             dstv_header_data = assemble_dstv_header_data(project_number, 
@@ -137,8 +141,10 @@ def dstv_pipeline(step_path, project_number, matl_grade):
             # NC1
             generate_nc1_file(raw_df_holes, dstv_header_data, nc_path)
             # Drawing
+            generate_hole_projection_html(raw_df_holes, dstv_header_data, media_path, drawing_path)
             
-            
+
+
 
             # results.append({
             #     "ID": member_id,
@@ -173,4 +179,4 @@ if __name__ == "__main__":
     # step_path = "../../data/TestUEAMirror.step"
     # step_path = "../../data/TestPFC.step"
 
-    dstv_pipeline(step_path, "99999", "S355")
+    dstv_pipeline(step_path, "10206", "S355")
