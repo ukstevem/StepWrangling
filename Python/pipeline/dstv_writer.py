@@ -15,12 +15,14 @@ def create_project_directories(project_number):
     cad_path = os.path.join(base_path, "cad")
     step_path = os.path.join(cad_path, "step")
     brep_path = os.path.join(cad_path, "brep")
+    dxf_path = os.path.join(cad_path, "dxf")
     thumb_path = os.path.join(base_path, "thumbs")
 
-    for path in [nc1_path, reports_path, drawings_path, cad_path, thumb_path, step_path, brep_path]:
+
+    for path in [nc1_path, reports_path, drawings_path, cad_path, thumb_path, step_path, brep_path,dxf_path]:
         os.makedirs(path, exist_ok=True)
 
-    return base_path, nc1_path, reports_path, drawings_path, cad_path, thumb_path, step_path, brep_path
+    return base_path, nc1_path, reports_path, drawings_path, cad_path, thumb_path, step_path, brep_path, dxf_path
 
 def assemble_dstv_header_data(project_number, step_path, matl_grade, member_id, profile_match):
     """
@@ -104,3 +106,4 @@ def generate_nc1_file(df_holes, header_data, nc_path):
                 
         f.write('EN\n')
     print(f"DSTV header written to {filename}")
+    return filename

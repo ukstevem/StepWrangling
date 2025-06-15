@@ -191,7 +191,9 @@ def generate_hole_projection_html(
     os.makedirs(os.path.dirname(drawing_path), exist_ok=True)
     
     # Write to file
-    with open(f"{drawing_path}\{header_data['out_filename']}.html", "w") as f:
+    html_filename = f"{drawing_path}\{header_data['out_filename']}.html"
+    with open(f"{html_filename}", "w") as f:
         f.write(html)
     
     print(f"✅ Full hole drawing saved to: {header_data['out_filename']}.html")
+    return html_filename

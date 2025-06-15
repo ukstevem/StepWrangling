@@ -28,7 +28,7 @@ def load_step_file(filepath):
             solids.append(solid)
             explorer.Next()
 
-        print(f"Loaded {len(solids)} solids from {filepath}")
+        print(f"\nLoaded {len(solids)} solids from {filepath}")
         return solids
 
     except Exception as e:

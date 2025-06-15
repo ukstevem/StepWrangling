@@ -59,11 +59,19 @@ def classify_profile(cs, json_path, tol_dim=1.0, tol_area=0.05):
     original, score1 = try_match(cs["span_web"], cs["span_flange"])
     swapped, score2  = try_match(cs["span_flange"], cs["span_web"])
    
+    best_match = None
     if original and (not swapped or score1 <= score2):
         original["Requires_rotation"] = False
-        return original
+        best_match = original
     elif swapped:
         swapped["Requires_rotation"] = True
-        return swapped
-    else:
-        return None
+        best_match = swapped
+
+    # Patch angle logic if applicable
+    if best_match and best_match.get("Profile_type") == "L":
+        wt = best_match["JSON"]["web_thickness"]
+        best_match["JSON"]["flange_thickness"] = wt
+        best_match["STEP"]["flange_thickness"] = wt
+
+    return best_match
+
