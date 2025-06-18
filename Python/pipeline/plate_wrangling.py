@@ -9,7 +9,10 @@ from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.GeomLProp import GeomLProp_SLProps
 
+from pipeline.geometry_utils import get_volume_from_step, get_volume_from_shape
+
 THICKNESS_LIMIT_MM = 75.0
+mat_density = 7840
 
 def compute_section_and_length_and_origin_from_obb(solid):
     obb = Bnd_OBB()
@@ -67,9 +70,7 @@ def align_plate_to_xy_plane(solid):
         thickness_mm = 2.0 * half_extents[thickness_idx]
         length_mm = 2.0 * half_extents[length_idx]
         width_mm = 2.0 * half_extents[width_idx]
-
-        if thickness_mm > THICKNESS_LIMIT_MM:
-            return False, None, None, thickness_mm, "Too thick for plate"
+        step_mass = get_volume_from_shape(solid)*0.00000785
 
         # 2) Collect nearly-planar faces
         faces = []
@@ -80,13 +81,13 @@ def align_plate_to_xy_plane(solid):
                 faces.append(f)
             exp.Next()
         if not faces:
-            return False, None, None, thickness_mm, length_mm, width_mm, "No planar faces found"
+            return False, solid, None, thickness_mm, length_mm, width_mm, step_mass, "No planar faces found"
 
         # 3) Largest face normal
         largest = max(faces, key=get_face_area)
         fn = get_face_normal(largest)
         if fn is None:
-            return False, None, None, thickness_mm, length_mm, width_mm, "Could not determine face normal"
+            return False, solid, None, thickness_mm, length_mm, width_mm, step_mass, "Could not determine face normal"
 
         # 4) Build DSTV axes (force correct types)
         cx = gp_Pnt(center.X(), center.Y(), center.Z())
@@ -103,7 +104,11 @@ def align_plate_to_xy_plane(solid):
         tr.SetTransformation(dstv_ax3, world_ax3)
         transformed = BRepBuilderAPI_Transform(solid, tr, True).Shape()
 
-        return True, transformed, dstv_ax3, thickness_mm, length_mm, width_mm, "Plate aligned and transformed to XY plane"
+        if thickness_mm > THICKNESS_LIMIT_MM:
+            print("Too thick for plate")
+            return False, transformed, dstv_ax3, thickness_mm, length_mm, width_mm, step_mass, "Too thick for plate"
+
+        return True, transformed, dstv_ax3, thickness_mm, length_mm, width_mm, step_mass, "Plate aligned and transformed to XY plane"
 
     except Exception as e:
-        return False, None, None, None, f"Unhandled error: {e}"
+        return False, None, None, None, None, None, None, f"Unhandled error: {e}"

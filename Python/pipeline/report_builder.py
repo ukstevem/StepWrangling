@@ -8,37 +8,45 @@ def record_solid(
     name: str,
     step_path: str,  # path to the file this solid created
     thumb_path: str,  # path to a thumbnail image for that output
-    drawing_path: str,
+    drilling_path: str,
     dxf_path: str,
     nc1_path: str,
+    brep_path: str,
+    mass: str,
     obb_x: int,
     obb_y: int,
     obb_z: int,
     obj_type: str,
-    issues: str
+    issues: str,
+    hash: str,
+    dxf_thumb_path : str
     ):
     row = {
         "Item ID": name,
         "Item Type": obj_type,
-        "STEP File": Path(rf"../../{step_path}"),
-        "Image": Path(rf"../../{thumb_path}"),
-        "Drilling Drawing": Path(rf"../../{drawing_path}"),
-        "Profile DXF": Path(rf"../../{dxf_path}"),
-        "NC1 File": Path(rf"../../{nc1_path}"),
-        "X": obb_x,
-        "Y": obb_y,
-        "Z": obb_z,
-        "Issues": issues
+        "STEP File": Path(rf"{step_path}"),
+        "Image": Path(rf"{thumb_path}"),
+        "Drilling Drawing": Path(rf"{drilling_path}"),
+        "DXF Thumb": Path(rf"{dxf_thumb_path}"),
+        "Profile DXF": Path(rf"{dxf_path}"),
+        "NC1 File": Path(rf"{nc1_path}"),
+        "BREP": Path(rf"{brep_path}"),
+        "Mass (kg)": mass,
+        "X (mm)": obb_x,
+        "Y (mm)": obb_y,
+        "Z (mm)": obb_z,
+        "Issues": issues,
+        "Hash": hash
     }
     return report_rows.append(row)
 
-
 def df_to_html_with_images(df, output_dir, project_number):
     """
-    Exports a DataFrame to a styled HTML report with:
-      - Clickable file:/// links that launch native apps
+    Exports a DataFrame to a styled, sortable HTML report with:
+      - Clickable file:/// links
       - Thumbnail images
-      - Custom CSS for a cleaner look
+      - Custom CSS
+      - Column‐header sorting via sorttable.js
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -47,32 +55,35 @@ def df_to_html_with_images(df, output_dir, project_number):
     # 1) Prepare a copy for HTML
     df_html = df.copy()
 
-    # Helper to make file:// links
     def make_file_link(path):
         p = Path(path).resolve()
-        uri = p.as_uri()  # yields file:///C:/...
-        name = p.name
-        return f'<a href="{uri}" target="_blank">{name}</a>'
+        return f'<a href="{p.as_uri()}" download target="_blank">{p.name}</a>'
 
-    # Columns with files
-    for col in ['STEP File', 'Drilling Drawing', 'Profile DXF', 'NC1 File']:
+    for col in ['STEP File', 'Drilling Drawing', 'Profile DXF', 'NC1 File', 'BREP']:
         if col in df_html:
             df_html[col] = df_html[col].apply(make_file_link)
 
-    # Image thumbnails
-    if 'Image' in df_html:
-        df_html['Image'] = df_html['Image'].apply(
+    for col in ['Image', 'DXF Thumb']:
+        if col in df_html:
+            df_html[col] = df_html[col].apply(
             lambda p: f'<img src="{p}" style="max-width:120px; height:auto; border-radius:4px;"/>'
         )
 
-    # 2) Build the full HTML with embedded CSS
+    # 2) Get the table HTML with a `sortable` class
+    table_html = df_html.to_html(
+        escape=False,
+        index=False,
+        classes="sortable"   # ← pandas will emit <table class="sortable" …>
+    )
+
+    # 3) Embed CSS + sorttable.js
     css = """
     <style>
       body { font-family: Arial, sans-serif; padding: 1em; }
       h1 { font-size: 1.5em; }
       table { border-collapse: collapse; width: 100%; }
-      th, td { border: 1px solid #ddd; padding: 0.5em; vertical-align: middle; }
-      th { background-color: #f4f4f4; text-align: left; }
+      th, td { border: 1px solid #ddd; padding: 0.5em; vertical-align: middle; cursor: pointer; }
+      th { background-color: #f4f4f4; }
       tr:nth-child(even) { background-color: #fafafa; }
       tr:hover { background-color: #f1f1f1; }
       a { color: #0077cc; text-decoration: none; }
@@ -87,49 +98,82 @@ def df_to_html_with_images(df, output_dir, project_number):
     <meta charset="utf-8">
     <title>Project {project_number} Report</title>
     {css}
+    <!-- sorttable.js makes any table with class="sortable" clickable -->
+    <script src="https://www.kryogenix.org/code/browser/sorttable/sorttable.js"></script>
   </head>
   <body>
     <h1>Project {project_number} Pipeline Report</h1>
-    {df_html.to_html(escape=False, index=False)}
+    {table_html}
   </body>
 </html>
 """
 
-    # 3) Write out
-    print(f"Writing report to HTML at {html_path}")
+    # print(f"Writing report to HTML at {html_path}")
     html_path.write_text(html, encoding="utf-8")
 
 
 
+# 3b) Export to Excel with images inserted into cells (using XlsxWriter):
+import os
+from pathlib import Path
+import pandas as pd
 
-# # 3b) Export to Excel with images inserted into cells (using XlsxWriter):
-# def df_to_excel_with_images(df, excel_path):
-#     with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
-#         df.to_excel(writer, sheet_name="report", index=False, startrow=1)
-#         workbook  = writer.book
-#         worksheet = writer.sheets["report"]
+def df_to_excel_with_images(
+    df: pd.DataFrame,
+    excel_dir: str,
+    project_number: str,
+    file_cols=None,
+    image_col="Image"
+):
+    """
+    Exports df to <excel_dir>/<project_number>.xlsx, inserting:
+      • Clickable external: links for any column in file_cols
+      • Embedded thumbnails for image_col
+    """
+    # 1) Defaults for your schema
+    if file_cols is None:
+        file_cols = ["STEP File", "Drilling Drawing", "Profile DXF", "NC1 File"]
 
-#         # Write header formatting (optional)
-#         header_format = workbook.add_format({"bold": True, "bg_color": "#F0F0F0"})
-#         for col_num, value in enumerate(df.columns.values):
-#             worksheet.write(0, col_num, value, header_format)
+    excel_dir = Path(excel_dir)
+    excel_dir.mkdir(parents=True, exist_ok=True)
+    out_path = excel_dir / f"{project_number}.xlsx"
 
-#         # Insert hyperlinks and thumbnails
-#         for row_idx, row in enumerate(report_rows, start=1):
-#             # hyperlink in “output_file” column
-#             file_col = df.columns.get_loc("output_file")
-#             worksheet.write_url(
-#                 row_idx, file_col,
-#                 f"external:{row['output_file']}",
-#                 string=os.path.basename(row['output_file'])
-#             )
-#             # image in “thumbnail” column
-#             thumb_col = df.columns.get_loc("thumbnail")
-#             worksheet.set_row(row_idx, 80)  # adjust row height
-#             worksheet.insert_image(
-#                 row_idx, thumb_col,
-#                 row["thumbnail"],
-#                 {"x_scale": 0.5, "y_scale": 0.5, "x_offset": 2, "y_offset": 2}
-#             )
+    # 2) Get column indices
+    file_col_inds = [(c, df.columns.get_loc(c)) for c in file_cols if c in df.columns]
+    img_col_ind  = df.columns.get_loc(image_col) if image_col in df.columns else None
 
-# df_to_excel_with_images(df, "pipeline_report.xlsx")
+    # 3) Write DataFrame and then overwrite links/images
+    with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
+        sheet = "Report"
+        df.to_excel(writer, sheet_name=sheet, index=False, startrow=1)
+        wb  = writer.book
+        ws  = writer.sheets[sheet]
+
+        # 4) Header row styling
+        hdr_fmt = wb.add_format({"bold": True, "bg_color": "#F0F0F0"})
+        for col_idx, hdr in enumerate(df.columns):
+            ws.write(0, col_idx, hdr, hdr_fmt)
+
+        # 5) Loop over each row record
+        for row_idx, record in enumerate(df.to_dict(orient="records"), start=1):
+            # a) hyperlinks for each file column
+            for col_name, col_idx in file_col_inds:
+                fp = record[col_name]
+                if fp:
+                    ws.write_url(
+                        row_idx, col_idx,
+                        f"external:{fp}",
+                        string=Path(fp).name
+                    )
+            # b) insert image if column exists
+            if img_col_ind is not None:
+                thumb = record[image_col]
+                if thumb and Path(thumb).exists():
+                    ws.set_row(row_idx, 80)  # enough height
+                    ws.insert_image(
+                        row_idx, img_col_ind,
+                        thumb,
+                        {"x_scale": 0.5, "y_scale": 0.5, "x_offset": 2, "y_offset": 2}
+                    )
+
+    print(f"Wrote Excel report to {out_path}")

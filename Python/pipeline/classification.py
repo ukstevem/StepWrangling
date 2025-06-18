@@ -14,10 +14,12 @@ def classify_profile(cs, json_path, tol_dim=1.0, tol_area=0.05):
             for name, info in ents.items():
                 dh = abs(height - info["height"])
                 dw = abs(width  - info["width"])
-                if dh > tol_dim or dw > tol_dim:
-                    continue
                 ea = abs(cs["area"] - info["csa"]) / info["csa"]
+                # print(f"[CSA] checking {name}: cs_area={cs['area']:.1f}, lib_csa={info['csa']:.1f}, rel_err={ea:.1%}, tol_area={tol_area:.1%}")
                 if ea > tol_area:
+                    # print(f"  → SKIPPING {name} (CSA error {ea:.1%} > tol_area)\n")
+                    continue
+                if dh > tol_dim or dw > tol_dim:
                     continue
                 el = abs(cs["length"] - info.get("length", cs["length"])) / info.get("length", cs["length"])
                 score = dh + dw + ea * 100 + el * 100

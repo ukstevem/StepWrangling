@@ -1,34 +1,12 @@
 import os
-import pandas as pd
-import pathlib
-
-
-def create_project_directories(project_number):
-    """
-    Creates the output directory structure for a project if it doesn't exist.
-    Returns the base path and subfolder paths.
-    """
-    base_path = os.path.join("../../data", "Projects", project_number)
-    nc1_path = os.path.join(base_path, "Nc1")
-    reports_path = os.path.join(base_path, "Reports")
-    drawings_path = os.path.join(base_path, "Drawings")
-    cad_path = os.path.join(base_path, "cad")
-    step_path = os.path.join(cad_path, "step")
-    brep_path = os.path.join(cad_path, "brep")
-    dxf_path = os.path.join(cad_path, "dxf")
-    thumb_path = os.path.join(base_path, "thumbs")
-
-
-    for path in [nc1_path, reports_path, drawings_path, cad_path, thumb_path, step_path, brep_path,dxf_path]:
-        os.makedirs(path, exist_ok=True)
-
-    return base_path, nc1_path, reports_path, drawings_path, cad_path, thumb_path, step_path, brep_path, dxf_path
+import tempfile
+from pathlib import Path
 
 def assemble_dstv_header_data(project_number, step_path, matl_grade, member_id, profile_match):
     """
     Assembles header data dictionary for DSTV NC1 file.
     """
-    filename_stem = pathlib.Path(step_path).stem
+    filename_stem = Path(step_path).stem
     out_filename = f"{filename_stem}-{member_id}"
     model_filename = f"{filename_stem}.step"
 
@@ -55,19 +33,103 @@ def assemble_dstv_header_data(project_number, step_path, matl_grade, member_id, 
 
     return header_dict
 
-def generate_nc1_file(df_holes, header_data, nc_path):
+# def generate_nc1_file(df_holes, header_data, nc_path):
 
-    """
-    Write DSTV NC1 ST-block header to .nc1 file with specified order
-    """
-    faces = ['V', 'U', 'O']  #Face priority order
+#     """
+#     Write DSTV NC1 ST-block header to .nc1 file with specified order
+#     """
+#     faces = ['V', 'U', 'O']  #Face priority order
 
-    filename = f"{nc_path}\{header_data['out_filename']}.nc1"
-    with open(filename, 'w') as f:
-        f.write('ST\n')
+#     filename = f"{nc_path}\{header_data['out_filename']}.nc1"
+#     with open(filename, 'w') as f:
+#         f.write('ST\n')
+#         f.write(f"  {header_data['project_number']}\n")
+#         f.write(f"  {header_data['model_filename']}\n")
+#         f.write(f"  Drill-Cut\n")
+#         f.write(f"  {header_data['out_filename']}\n")
+#         f.write(f"  {header_data['material_grade']}\n")
+#         f.write(f"  {header_data['quantity']}\n")
+#         f.write(f"  {header_data['Designation']}\n")
+#         f.write(f"  {header_data['code_profile']}\n")
+#         f.write(f"    {header_data['Length']:8.2f}\n")
+#         f.write(f"    {header_data['Height']:8.2f}\n")
+#         f.write(f"    {header_data['Width']:8.2f}\n")
+#         f.write(f"    {header_data['flange_thickness']:8.2f}\n")
+#         f.write(f"    {header_data['web_thickness']:8.2f}\n")
+#         f.write(f"    {header_data['root_radius']:8.2f}\n")
+#         f.write(f"    {header_data['Mass']:8.2f}\n")
+#         f.write('        0.00\n') #surface area
+#         # Following the spec, three zeros
+#         f.write('        0.00\n')
+#         f.write('        0.00\n')
+#         f.write('        0.00\n')
+#         f.write('        0.00\n')
+#         f.write('  -\n')
+#         f.write('  -\n')
+#         f.write('  -\n')
+#         f.write('  -\n')
+        
+#         # BO blocks by face
+#         for face in faces:
+#             df_face = df_holes[df_holes['Code'] == face]
+#             if df_face.empty:
+#                 continue
+#             f.write('BO\n')
+#             for _, row in df_face.iterrows():
+#                 x = row['X (mm)']
+#                 y = row['Y (mm)']
+#                 d = row['Diameter (mm)']
+#                 # Right-align numeric columns: x, y (8-wide), diameter (6-wide)
+#                 f.write(f"  {face.lower()}  {x:8.2f} {y:8.2f} {d:6.2f}\n")
+                
+#         f.write('EN\n')
+
+#         nc1_hash = nc1_group_key(filename)
+
+#     print(f"DSTV written to {filename}")
+
+
+#     return filename, nc1_hash
+
+
+import hashlib
+from pathlib import Path
+
+def nc1_group_key(nc1_path: Path | str, skip_first: int = 5) -> str:
+    """
+    Return the MD5 of the NC1 file *from* line skip_first+1 onward.
+    Lines are split on '\n' (after normalizing CRLF → LF), and then
+    re-joined with '\n' before hashing.
+    """
+    p = Path(nc1_path)
+    # read & normalize line endings
+    text = p.read_text(encoding="utf-8").replace("\r\n", "\n")
+    lines = text.split("\n")
+
+    # drop the first `skip_first` lines
+    relevant = lines[skip_first:]
+    # if you want to preserve a trailing newline, you can do:
+    # data = "\n".join(relevant) + "\n"
+    data = "\n".join(relevant)
+
+    return hashlib.md5(data.encode("utf-8")).hexdigest()
+
+
+def generate_nc1_file(df_holes, header_data, nc_dir) -> tuple[Path, str]:
+    """
+    Write a DSTV NC1 to nc_dir/<out_filename>.nc1, then return (path, hash).
+    """
+    nc_dir = Path(nc_dir)
+    nc_dir.mkdir(parents=True, exist_ok=True)
+
+    out_file = nc_dir / f"{header_data['out_filename']}.nc1"
+
+    # Write with explicit '\n' line endings:
+    with out_file.open("w", encoding="utf-8", newline="\n") as f:
+        f.write("ST\n")
         f.write(f"  {header_data['project_number']}\n")
         f.write(f"  {header_data['model_filename']}\n")
-        f.write(f"  Drill-Cut\n")
+        f.write("  Drill-Cut\n")
         f.write(f"  {header_data['out_filename']}\n")
         f.write(f"  {header_data['material_grade']}\n")
         f.write(f"  {header_data['quantity']}\n")
@@ -80,30 +142,32 @@ def generate_nc1_file(df_holes, header_data, nc_path):
         f.write(f"    {header_data['web_thickness']:8.2f}\n")
         f.write(f"    {header_data['root_radius']:8.2f}\n")
         f.write(f"    {header_data['Mass']:8.2f}\n")
-        f.write('        0.00\n') #surface area
-        # Following the spec, three zeros
-        f.write('        0.00\n')
-        f.write('        0.00\n')
-        f.write('        0.00\n')
-        f.write('        0.00\n')
-        f.write('  -\n')
-        f.write('  -\n')
-        f.write('  -\n')
-        f.write('  -\n')
-        
+        f.write("        0.00\n")  # surface area
+        f.write("        0.00\n")
+        f.write("        0.00\n")
+        f.write("        0.00\n")
+        f.write("        0.00\n")
+        f.write("  -\n" * 4)
+        if df_holes.empty:
+            pass
+        else:
         # BO blocks by face
-        for face in faces:
-            df_face = df_holes[df_holes['Code'] == face]
-            if df_face.empty:
-                continue
-            f.write('BO\n')
-            for _, row in df_face.iterrows():
-                x = row['X (mm)']
-                y = row['Y (mm)']
-                d = row['Diameter (mm)']
-                # Right-align numeric columns: x, y (8-wide), diameter (6-wide)
-                f.write(f"  {face.lower()}  {x:8.2f} {y:8.2f} {d:6.2f}\n")
-                
-        f.write('EN\n')
-    print(f"DSTV header written to {filename}")
-    return filename
+            print("Its getting by")
+            for face in ['V', 'U', 'O']:
+                df_face = df_holes[df_holes['Code'] == face]
+                if df_face.empty:
+                    continue
+                f.write("BO\n")
+                for _, row in df_face.iterrows():
+                    x = row['X (mm)']
+                    y = row['Y (mm)']
+                    d = row['Diameter (mm)']
+                    f.write(f"  {face.lower()}  {x:8.2f} {y:8.2f} {d:6.2f}\n")
+
+        f.write("EN\n")
+
+    # Compute the hash of the freshly written file:
+    nc1_hash = nc1_group_key(out_file)
+
+    print(f"✅ DSTV written to {out_file}, hash={nc1_hash}")
+    return out_file, nc1_hash

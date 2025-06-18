@@ -10,7 +10,11 @@ from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.TopoDS import topods
 from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Section
+from OCC.Core.STEPControl import STEPControl_Reader
+from OCC.Core.IFSelect import IFSelect_RetDone
+from OCC.Core.TopoDS import TopoDS_Shape
 
+from pathlib import Path
 import numpy as np
 
 def robust_align_solid_from_geometry(solid, tol=1e-3):
@@ -136,76 +140,37 @@ def compute_obb_geometry(aligned_shape):
         "aligned_center": center
     }
 
+def get_volume_from_step(step_path: Path) -> float:
+    """
+    Reads a STEP file and returns its solid volume (in model units³).
+    Raises on any read or transfer error.
+    """
+    reader = STEPControl_Reader()
+    status = reader.ReadFile(str(step_path))
+    if status != IFSelect_RetDone:
+        raise RuntimeError(f"Cannot read STEP file: {step_path!r}")
 
-# def compute_section_area(shape, slice_x=0.5, tol=1e-2, min_area=100, max_area=20000):
-#     """
-#     Computes the cross-sectional area of a solid by slicing at a given X,
-#     building a wire from edges, and computing the face area.
+    # Transfer all roots into a single compound shape
+    reader.TransferRoots()
+    shape = reader.OneShape()  # TopoDS_Shape
 
-#     Automatically rejects invalid areas.
-#     """
+    # Compute volume
+    props = GProp_GProps()
+    brepgprop.VolumeProperties(shape, props)
+    volume = props.Mass()
 
-#     # Compute bounding box and slicing location
-#     aabb = Bnd_Box()
-#     brepbndlib.Add(shape, aabb)
-#     xmin, _, _, xmax, _, _ = aabb.Get()
-#     section_x = xmin + slice_x * (xmax - xmin)
-#     print(f"📏 Sectioning at X={section_x:.2f} with tolerance={tol}")
+    return volume
 
-#     # Cutting plane
-#     plane = gp_Pln(gp_Pnt(section_x, 0, 0), gp_Dir(1, 0, 0))
-#     section = BRepAlgoAPI_Section(shape, plane, False)
-#     section.ComputePCurveOn1(True)
-#     section.Approximation(True)
-#     section.Build()
-
-#     section_shape = section.Shape()
-
-#     # Extract edges
-#     explorer = TopExp_Explorer(section_shape, TopAbs_EDGE)
-#     edges = []
-#     while explorer.More():
-#         edges.append(explorer.Current())
-#         explorer.Next()
-
-#     if not edges:
-#         raise RuntimeError("❌ No edges found in section shape.")
-
-#     # Build wire
-#     wire_maker = BRepBuilderAPI_MakeWire()
-#     for edge in edges:
-#         wire_maker.Add(edge)
-
-#     if not wire_maker.IsDone():
-#         raise RuntimeError("❌ Failed to create wire from section edges.")
-
-#     wire = wire_maker.Wire()
-#     if wire.IsNull():
-#         raise RuntimeError("❌ Wire is null.")
-
-#     # Build face and compute area
-#     face_maker = BRepBuilderAPI_MakeFace(wire)
-#     if not face_maker.IsDone():
-#         raise RuntimeError("❌ Failed to create face from wire.")
-
-#     face = face_maker.Face()
-#     props = GProp_GProps()
-#     brepgprop.SurfaceProperties(face, props)
-#     area = props.Mass()
-
-#     print(f"✅ Section area: {area:.2f} mm²")
-
-#     # Sanity check
-#     if area < min_area or area > max_area:
-#         raise ValueError(f"❌ CSA {area:.2f} mm² out of expected range ({min_area}–{max_area} mm²)")
-
-#     return area
+def get_volume_from_shape(shape: TopoDS_Shape) -> float:
+    """
+    Computes and returns the enclosed volume of the given solid shape.
+    The result is in the model’s cubic units (e.g. mm³ if your geometry is in mm).
+    """
+    props = GProp_GProps()
+    brepgprop.VolumeProperties(shape, props)
+    return props.Mass()
 
 
-from OCC.Core.BRepGProp import brepgprop
-from OCC.Core.Bnd import Bnd_Box
-from OCC.Core.BRepBndLib import brepbndlib
-from OCC.Core.GProp import GProp_GProps
 
 def compute_section_area(solid):
     """

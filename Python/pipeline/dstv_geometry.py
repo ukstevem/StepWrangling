@@ -98,6 +98,8 @@ def check_duplicate_holes(df_holes, tolerance=0.1):
     Checks for duplicate holes (same X, Y, and Code) within a given tolerance (in mm).
     returns a dataframe of duplicates, or False if no duplicates are found.
     """
+    if df_holes is None or df_holes.empty:
+        return False, df_holes
     # Round to given tolerance (to handle small numeric noise)
     df_check = df_holes.copy()
     df_check["X_r"] = (df_check["X (mm)"] / tolerance).round().astype(int)

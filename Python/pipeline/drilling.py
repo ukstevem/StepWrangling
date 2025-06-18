@@ -4,23 +4,41 @@ from io import BytesIO
 from base64 import b64encode
 import os
 import pandas as pd
+from pathlib import Path
 
 def generate_hole_projection_html(
     df_holes,
     header_data,
     logo_path,
-    drawing_path
-):
+    drilling_path
+  ):
 
-    print("Generating Drawing")
+    # print("Generating Drawing")
 
-    logo = logo_path+"\PSS_Standard_RGB.png"
-    df = df_holes.copy()
-    df_sorted = df.sort_values(by=["Code", "Diameter (mm)", "X (mm)", "Y (mm)"]).copy()
-    df_sorted["Hole ID"] = (
-        df_sorted.groupby("Code").cumcount() + 1
-    ).astype(str).str.zfill(2)
-    df_sorted["ID"] = df_sorted["Code"] + "-" + df_sorted["Hole ID"]
+    logo = fr"./{logo_path}/PSS_Standard_RGB.png"
+    # print(logo)
+
+    # --- guard: if no holes, create an empty DataFrame with the expected columns
+
+    if df_holes is None or df_holes.empty:
+        df = pd.DataFrame(columns=[
+            "Code","X (mm)","Y (mm)","Diameter (mm)",
+            "Hole ID","ID"
+        ])
+    else:
+        df = df_holes.copy()
+
+    # safe sort/ID generation on possibly‐empty df
+    df_sorted = df.sort_values(
+        by=["Code", "Diameter (mm)", "X (mm)", "Y (mm)"],
+        ignore_index=True
+    ).copy()
+    # only generate Hole ID / ID if there really are rows
+    if not df_sorted.empty:
+        df_sorted["Hole ID"] = (
+            df_sorted.groupby("Code").cumcount() + 1
+        ).astype(str).str.zfill(2)
+        df_sorted["ID"] = df_sorted["Code"] + "-" + df_sorted["Hole ID"]
 
     length = header_data["Length"]
     y_min, y_max = df_sorted["Y (mm)"].min(), df_sorted["Y (mm)"].max()
@@ -188,10 +206,10 @@ def generate_hole_projection_html(
     html += "</body></html>"
 
     # Ensure output directory exists
-    os.makedirs(os.path.dirname(drawing_path), exist_ok=True)
+    os.makedirs(drilling_path, exist_ok=True)
     
     # Write to file
-    html_filename = f"{drawing_path}\{header_data['out_filename']}.html"
+    html_filename = Path(fr"{drilling_path}/{header_data['out_filename']}.html")
     with open(f"{html_filename}", "w") as f:
         f.write(html)
     
