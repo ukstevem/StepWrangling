@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import math
 from io import BytesIO
 from base64 import b64encode
 import os
@@ -10,13 +11,13 @@ def generate_hole_projection_html(
     df_holes,
     header_data,
     logo_path,
-    drilling_path
+    drilling_path,
+    web_cuts
   ):
 
     # print("Generating Drawing")
-
-    logo = fr"./{logo_path}/PSS_Standard_RGB.png"
-    # print(logo)
+    logo_path = Path(logo_path)       # ensure it’s a Path
+    logo = logo_path / "PSS_Standard_RGB.png"
 
     # --- guard: if no holes, create an empty DataFrame with the expected columns
 
@@ -33,6 +34,7 @@ def generate_hole_projection_html(
         by=["Code", "Diameter (mm)", "X (mm)", "Y (mm)"],
         ignore_index=True
     ).copy()
+
     # only generate Hole ID / ID if there really are rows
     if not df_sorted.empty:
         df_sorted["Hole ID"] = (
@@ -95,7 +97,19 @@ def generate_hole_projection_html(
             dy = -30 if i % 2 == 0 else 20
             ax.text(x, y + dy, row["ID"], fontsize=6, ha='center')
 
-
+        # ─── draw end‐cut lines on the V face ───────────────────
+        if face_code == "V":
+            # get height of this face in mm
+            face_height = float(header_data.get("Height", y_max))
+            for label, angle_deg in web_cuts.items():
+                # X‐pos of the cut
+                x0 = 0 if label == "start" else float(header_data.get("Length", length))
+                # slope m = tan(tilt) in the V‐view (vertical axis = Y (height))
+                m = math.tan(math.radians(angle_deg))
+                # line from bottom (y=0) to top (y=face_height)
+                x1, y1 = x0, 0
+                x2, y2 = x0 + m * face_height, face_height
+                ax.plot([x1, x2], [y1, y2], color='red', linewidth=1.5)
 
     # Create figure with fixed panels
     fig, axs = plt.subplots(n_faces, 1, figsize=(12, 3 * n_faces))

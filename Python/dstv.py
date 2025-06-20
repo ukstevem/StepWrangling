@@ -16,7 +16,8 @@ from pipeline.geometry_utils import (robust_align_solid_from_geometry,
 from pipeline.classification import classify_profile
 from pipeline.summary_writer import section_result_table
 from pipeline.dstv_geometry import (classify_and_project_holes_dstv,
-                                    check_duplicate_holes
+                                    check_duplicate_holes,
+                                    analyze_end_faces_web_and_flange
                                      )
 from pipeline.dstv_writer import (generate_nc1_file, 
                                   assemble_dstv_header_data)
@@ -35,9 +36,10 @@ from pipeline.report_builder import (record_solid,
                                      df_to_excel_with_images)
 from pipeline.path_management import (resolve_output_path,  
                                   create_project_directories)
-
+from pipeline.database import (dump_df_to_supabase, normalize_report_df)
 from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3
 from pathlib import Path
+
 
 
 def dstv_pipeline(root_model, project_number, matl_grade):
@@ -46,35 +48,38 @@ def dstv_pipeline(root_model, project_number, matl_grade):
     # Generate folder structure and get paths
 
     # Static
-    media_path = Path(r"./media/")
-    json_path = Path(r"./data/Shape_classifier_info.json")
-    network_root = Path(r"G:/Customer Orders/Extraction")
-    fallback_root = Path(r"c:/dev/step-gemini/Extraction")
+    BASE = Path(__file__).parent
+    media_path = BASE / "media"
+    json_path = BASE / "data/Shape_classifier_info.json"
+    network_root = BASE / "G:/Customer Orders/Extraction"
+    fallback_root = BASE / "C:/dev/step-gemini/Extraction"
 
     # Project Driven
     base_path, nc_path, report_path, drilling_path, cad_path, thumb_path, step_path, brep_path, dxf_path, dxf_thumb = create_project_directories(project_number, network_root, fallback_root)
 
+    if not os.path.isfile(root_model):
+        raise FileNotFoundError(f"Couldn’t find STEP file at: {root_model!r}")
     solids = load_step_file(root_model)
     report_rows = []    #report array complied per part in loop
 
 
     for i, shape_orig in enumerate(solids):
         # set variable defaults
-        member_id = f"MEM-{i+1:03d}"
-        step_file = "-"
-        thumbnail_file = "-"
-        html_file = "-"
-        dxf_file = "-"
-        nc1_file = "-"
-        brep_file = "-"
-        step_mass = "-"
+        member_id = f"MEM-{i+1:04d}"
+        step_file = ""
+        thumbnail_file = ""
+        html_file = ""
+        dxf_file = ""
+        nc1_file = ""
+        brep_file = ""
+        step_mass = ""
         obb_x = "0"
         obb_y = "0"
         obb_z = "0"
         object_type = "-"
         issues = "-"
         hash = ""
-        dxf_thumb_file = "-"
+        dxf_thumb_file = ""
         print(f"\n🟦 Processing {member_id}... {datetime.now().strftime('%H:%M:%S')}")
 
         try:
@@ -133,7 +138,7 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                 brep_fingerprint, brep_file = export_solid_to_brep(final_aligned_solid, brep_path, member_id)
 
             else:
-                print("✅ Match found:")
+                print("✅ Section match found")
 
                 # STEP 6: Adjust orientation if needed
                 primary_aligned_shape, obb_geom = swap_width_and_height_if_required(
@@ -181,6 +186,8 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                 )
 
                 # print(section_result_table(profile_match))
+                web_cuts = analyze_end_faces_web_and_flange(refined_shape, dstv_frame)
+                # print(web_cuts)
 
                 # STEP 9: Classify and check holes
                 step_vals = profile_match["STEP"]
@@ -206,15 +213,13 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                                                             profile_match)
 
                 # STEP 10: Output
-                # NC1
-                
-                nc1_file, hash = generate_nc1_file(raw_df_holes, dstv_header_data, nc_path)
+                # NC1               
+                nc1_file, hash = generate_nc1_file(raw_df_holes, dstv_header_data, nc_path, web_cuts)
                 # Drawing
-                html_file = generate_hole_projection_html(raw_df_holes, dstv_header_data, media_path, drilling_path)
+                html_file = generate_hole_projection_html(raw_df_holes, dstv_header_data, media_path, drilling_path, web_cuts)
 
 
         except Exception as e:
-            print("Exception!")
             print(f"❌ Error in {member_id}: {e}")
             record_solid(report_rows, 
                      name = member_id,
@@ -257,27 +262,43 @@ def dstv_pipeline(root_model, project_number, matl_grade):
     report_df = pd.DataFrame(report_rows)
     # save_summary_table(summary_df, os.path.join(OUTPUT_DIR, "summary.html"))
     print("\n✅ Pipeline completed. Summary saved.")
+    # report_df.to_excel('output.xlsx', sheet_name='Sheet1', index=False)
 
+    # Create HTML report
     df_to_html_with_images(report_df, report_path, project_number)
-    # df_to_excel_with_images(report_df, report_path, project_number)
+
+    # Log to Supabase
+    report_for_db = normalize_report_df(report_df, project_number)
+    dump_df_to_supabase(report_for_db)
+
+
 
 if __name__ == "__main__":
 
-    step_path = "./data/C25001-1-0101-MAIN.step"
-    # step_path = "./data/MEM-026.step"     #Corner Leg Beam
-    # step_path = "./data/MEM-210.step"     #Heavy Beam
-    # step_path = "./data/MEM-003.step"     #Plate
-    # step_path = "./data/MEM-739.step"     #Formed Plate
-    # step_path = "./data/MEM-569.step"     #Plain Beam
-    # step_path = "./data/MEM-2122.step"    #Washer
-    # step_path = "./data/MEM-2124.step"    #Bolt Head
-    # step_path = "./data/0444-1 ANGLED.step"
-    # step_path = "./data/ncTest.step"
-    # step_path = "./data/TestEA.step"
-    # step_path = "./data/TestEAMirror.step"
-    # step_path = "./data/TestUEA.step"
-    # step_path = "./data/TestUEAMirror.step"
-    # step_path = "./data/TestPFC.step"
+    home_path = r"C:/Dev/step-gemini/Python/data"
+    step1 = "C25001-1-0101-MAIN.step"
+    step2 = "MEM-026.step"     #Corner Leg Beam
+    step3 = "MEM-210.step"     #Heavy Beam
+    step4 = "MEM-003.step"     #Plate
+    step5 = "MEM-739.step"     #Formed Plate
+    step6 = "MEM-569.step"     #Plain Beam
+    step7 = "MEM-418.step"     #Beam flange coped
+    step8 = "MEM-546.step"     #Beam web coped
+    step9 = "MEM-2122.step"    #Washer
+    step10 = "MEM-2124.step"    #Bolt Head
+    step11 = "0444-1 ANGLED.step"
+    step12 = "ncTest.step"
+    step13 = "TestEA.step"
+    step14 = "TestEAMirror.step"
+    step15 = "TestUEA.step"
+    step16 = "TestUEAMirror.step"
+    step17 = "TestPFC.step"
 
-    # dstv_pipeline(step_path, "10206-MAIN", "S355")
-    dstv_pipeline(step_path, "10206", "S355")
+    step_file = step1   
+    step_path = str(Path(home_path).joinpath(step_file))
+
+    # project = "10206"
+    project = "10206"
+    grade = "S355"
+
+    dstv_pipeline(step_path, project, grade)

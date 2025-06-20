@@ -11,8 +11,8 @@ from OCC.Core.GeomLProp import GeomLProp_SLProps
 
 from pipeline.geometry_utils import get_volume_from_step, get_volume_from_shape
 
-THICKNESS_LIMIT_MM = 75.0
-mat_density = 7840
+THICKNESS_LIMIT_MM = 101.0
+mat_density = .000000784
 
 def compute_section_and_length_and_origin_from_obb(solid):
     obb = Bnd_OBB()
@@ -52,7 +52,7 @@ def get_face_normal(face):
 
 def align_plate_to_xy_plane(solid):
     """
-    Detects a flat profile plate (thickness ≤ 75 mm), aligns so
+    Detects a flat profile plate (thickness ≤ 101 mm), aligns so
       X = length, Y = width, Z = thickness (face normal),
     transforms into the world XY plane, and returns:
       (is_plate: bool,
@@ -70,7 +70,7 @@ def align_plate_to_xy_plane(solid):
         thickness_mm = 2.0 * half_extents[thickness_idx]
         length_mm = 2.0 * half_extents[length_idx]
         width_mm = 2.0 * half_extents[width_idx]
-        step_mass = get_volume_from_shape(solid)*0.00000785
+        step_mass = get_volume_from_shape(solid)*mat_density
 
         # 2) Collect nearly-planar faces
         faces = []

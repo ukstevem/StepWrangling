@@ -170,24 +170,119 @@ def get_volume_from_shape(shape: TopoDS_Shape) -> float:
     brepgprop.VolumeProperties(shape, props)
     return props.Mass()
 
+# def compute_section_area(solid):
+#     """
+#     Computes the cross-sectional area by dividing the volume by the length.
+#     Assumes solid is aligned with X as the length axis.
+#     """
+#     props = GProp_GProps()
+#     brepgprop.VolumeProperties(solid, props)
+#     volume = props.Mass()
+
+#     bbox = Bnd_Box()
+#     brepbndlib.Add(solid, bbox)
+#     xmin, _, _, xmax, _, _ = bbox.Get()
+#     length = xmax - xmin  # assumes X is aligned to length
+
+#     area = volume / length if length > 0 else 0
+#     return area
+
+from OCC.Core.gp import gp_Pln, gp_Ax3, gp_Pnt, gp_Dir
+from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Section
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace
+from OCC.Core.TopExp import TopExp_Explorer
+from OCC.Core.TopAbs import TopAbs_EDGE
+from OCC.Core.GProp import GProp_GProps
+from OCC.Core.BRepGProp import brepgprop
+from OCC.Core.Bnd import Bnd_Box
+from OCC.Core.BRepBndLib import brepbndlib
 
 
-def compute_section_area(solid):
+def compute_section_area(solid, axis_dir=gp_Dir(1, 0, 0), sample_pos=None, tol=1e-6):
     """
-    Computes the cross-sectional area by dividing the volume by the length.
-    Assumes solid is aligned with X as the length axis.
+    Computes a cross-sectional area by slicing the solid and building a face.
+    Falls back to volume/length if edge loops aren’t closed.
     """
-    props = GProp_GProps()
-    brepgprop.VolumeProperties(solid, props)
-    volume = props.Mass()
-
+    # 1. Bounding box to find slice location
     bbox = Bnd_Box()
     brepbndlib.Add(solid, bbox)
-    xmin, _, _, xmax, _, _ = bbox.Get()
-    length = xmax - xmin  # assumes X is aligned to length
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+    length = xmax - xmin
+    if length <= tol:
+        return 0.0
 
-    area = volume / length if length > 0 else 0
-    return area
+    # 2. Define slicing plane (default slice at midpoint)
+    x0 = xmin + (length / 2.0 if sample_pos is None else sample_pos)
+    plane = gp_Pln(gp_Ax3(gp_Pnt(x0, 0, 0), axis_dir))
+
+    # 3. Perform section
+    section = BRepAlgoAPI_Section(solid, plane)
+    section.ComputePCurveOn1(True)
+    section.Approximation(True)
+    section.Build()
+    if not section.IsDone():
+        raise RuntimeError("Section operation failed")
+    edges_shape = section.Shape()
+
+    # 4. Extract edges
+    exp = TopExp_Explorer(edges_shape, TopAbs_EDGE)
+    edges = []
+    while exp.More():
+        edges.append(exp.Current())
+        exp.Next()
+    if not edges:
+        return 0.0
+
+    # 5. Attempt robust wire and face construction
+    try:
+        wire_builder = BRepBuilderAPI_MakeWire()
+        for e in edges:
+            wire_builder.Add(e)
+        if hasattr(wire_builder, 'Close'):
+            wire_builder.Close()
+        if not wire_builder.IsDone():
+            raise RuntimeError("Wire not closed")
+        wire = wire_builder.Wire()
+
+        face_maker = BRepBuilderAPI_MakeFace(plane)
+        face_maker.Add(wire)
+        props = GProp_GProps()
+        brepgprop.SurfaceProperties(face_maker.Face(), props)
+        return props.Mass()
+    except Exception:
+        # Fallback: approximate as volume/length
+        vol_props = GProp_GProps()
+        brepgprop.VolumeProperties(solid, vol_props)
+        volume = vol_props.Mass()
+        return volume / length
+
+
+def compute_average_section_area(solid, axis_dir=gp_Dir(1, 0, 0), n_samples=5, tol=1e-6):
+    """
+    Samples 'n_samples' cross-sections evenly along the length,
+    returns the average area and warns on >1% variation.
+    """
+    bbox = Bnd_Box()
+    brepbndlib.Add(solid, bbox)
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+    length = xmax - xmin
+    if length <= tol:
+        return 0.0
+
+    areas = []
+    for i in range(n_samples):
+        pos = (i + 0.5) * length / n_samples
+        areas.append(compute_section_area(solid, axis_dir, sample_pos=pos, tol=tol))
+
+    avg = sum(areas) / len(areas)
+    diff = max(areas) - min(areas)
+    if avg > 0 and diff > 0.01 * avg:
+        print(f"Warning: section area varies by more than 1% (min={min(areas):.6f}, max={max(areas):.6f})")
+    return avg
+
+
+
+
 
 
 def swap_width_and_height_if_required(profile_match, shape, obb_geom):

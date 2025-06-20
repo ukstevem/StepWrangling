@@ -1,0 +1,15 @@
+Todo
+
+Need to update the drilling drawing to show the flange cuts in u and o view.
+DSTV to be enhanced for scribing
+DSTV to be enhanced for milling
+Collation of data
+Upload to database and connection to excel
+production of BOM
+Integrate nesting
+catch errors
+
+
+Done
+
+need to update function for classification to take moutiple slices and collate the edges. taking section at the end will break if the end of beam is mitred or has holes expected

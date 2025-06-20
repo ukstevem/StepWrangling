@@ -115,7 +115,7 @@ def nc1_group_key(nc1_path: Path | str, skip_first: int = 5) -> str:
     return hashlib.md5(data.encode("utf-8")).hexdigest()
 
 
-def generate_nc1_file(df_holes, header_data, nc_dir) -> tuple[Path, str]:
+def generate_nc1_file(df_holes, header_data, nc_dir, web_cut) -> tuple[Path, str]:
     """
     Write a DSTV NC1 to nc_dir/<out_filename>.nc1, then return (path, hash).
     """
@@ -143,10 +143,10 @@ def generate_nc1_file(df_holes, header_data, nc_dir) -> tuple[Path, str]:
         f.write(f"    {header_data['root_radius']:8.2f}\n")
         f.write(f"    {header_data['Mass']:8.2f}\n")
         f.write("        0.00\n")  # surface area
-        f.write("        0.00\n")
-        f.write("        0.00\n")
-        f.write("        0.00\n")
-        f.write("        0.00\n")
+        f.write(f"   {web_cut['start_web']:8.1f}\n")
+        f.write(f"   {web_cut['end_web']:8.1f}\n")
+        f.write(f"   {web_cut['start_flange']:8.1f}\n")
+        f.write(f"   {web_cut['end_flange']:8.1f}\n")
         f.write("  -\n" * 4)
         if df_holes.empty:
             pass
