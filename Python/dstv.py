@@ -1,5 +1,6 @@
 # main.py - Entry point for DSTV pipeline
 
+from datetime import datetime
 import os
 import pandas as pd
 from datetime import datetime
@@ -12,6 +13,9 @@ from pipeline.geometry_utils import (robust_align_solid_from_geometry,
                                      compute_dstv_origin,
                                      align_obb_to_dstv_frame,
                                      refine_profile_orientation
+                                    )
+from pipeline.assembly_management import (
+                                     fingerprint_solids
                                      )
 from pipeline.classification import classify_profile
 from pipeline.summary_writer import section_result_table
@@ -36,7 +40,9 @@ from pipeline.report_builder import (record_solid,
                                      df_to_excel_with_images)
 from pipeline.path_management import (resolve_output_path,  
                                   create_project_directories)
-from pipeline.database import (dump_df_to_supabase, normalize_report_df)
+from pipeline.database import (dump_df_to_supabase, normalize_report_df,
+                                add_to_database
+                                )
 from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3
 from pathlib import Path
 
@@ -44,7 +50,9 @@ from pathlib import Path
 
 def dstv_pipeline(root_model, project_number, matl_grade):
 
-
+    # Log start time
+    start_time = datetime.now()
+    print(f"Start Time : {start_time}")
     # Generate folder structure and get paths
 
     # Static
@@ -60,8 +68,38 @@ def dstv_pipeline(root_model, project_number, matl_grade):
     if not os.path.isfile(root_model):
         raise FileNotFoundError(f"Couldn’t find STEP file at: {root_model!r}")
     solids = load_step_file(root_model)
-    report_rows = []    #report array complied per part in loop
 
+    # setup for fingerprint and saving out of the root model
+    # setting paths
+    root_name = Path(root_model).name            # e.g. "part123.step"
+    cad_file  = Path(cad_path) / root_name       # e.g. ".../Extraction/Proj1/Models/part123.step"
+    # compute an MD5 of the newly written STEP
+    hash_type = 'md5'
+    source_model_hash = fingerprint_solids(solids, str(cad_file), hash_type)
+    #write data to source_model table
+        #todo
+
+    # now insert a row into `source_model`
+    payload = {
+        "filename": Path(root_model).name,
+        "hash":     source_model_hash,
+        "project":  project_number
+    }
+    response = add_to_database(
+        payload,
+        table_name="source_model",
+        # if you want to enforce column whitelisting:
+        allowed_columns=["filename", "hash", "project"]
+    )
+
+    if not response.get("success"):
+        # log or re-raise depending on how you want to handle failures
+        raise RuntimeError(f"DB insert failed: {response['error']}")
+    print(f"Inserted source_model row: {response['data']!r}")
+
+
+    # Now get going on extraction
+    report_rows = []    #report array complied per part in loop
 
     for i, shape_orig in enumerate(solids):
         # set variable defaults
@@ -72,14 +110,16 @@ def dstv_pipeline(root_model, project_number, matl_grade):
         dxf_file = ""
         nc1_file = ""
         brep_file = ""
-        step_mass = ""
-        obb_x = "0"
-        obb_y = "0"
-        obb_z = "0"
+        step_mass = 0
+        obb_x = 0
+        obb_y = 0
+        obb_z = 0
         object_type = "-"
         issues = "-"
         hash = ""
         dxf_thumb_file = ""
+        section_shape = ""
+        assembly_hash = ""
         print(f"\n🟦 Processing {member_id}... {datetime.now().strftime('%H:%M:%S')}")
 
         try:
@@ -113,8 +153,6 @@ def dstv_pipeline(root_model, project_number, matl_grade):
             # STEP 5: Match profile
             profile_match = classify_profile(cs_data, json_path, tol_dim=1.0, tol_area=.05)
             
-            # print(f"Profile Match Data: {profile_match['JSON']}\n {profile_match['STEP']}")
-
             # STEP 5.5: no match? check for plate
             if profile_match is None:
                 is_plate, final_aligned_solid, ax3, thickness_mm, length_mm, width_mm, step_mass, msg = align_plate_to_xy_plane(primary_aligned_shape)
@@ -139,6 +177,7 @@ def dstv_pipeline(root_model, project_number, matl_grade):
 
             else:
                 print("✅ Section match found")
+                # print(f"Profile Match Data: {profile_match}, {profile_match['JSON']}\n {profile_match['STEP']}")
 
                 # STEP 6: Adjust orientation if needed
                 primary_aligned_shape, obb_geom = swap_width_and_height_if_required(
@@ -173,7 +212,8 @@ def dstv_pipeline(root_model, project_number, matl_grade):
 
                 # cad output
                 # export_solid_to_brep(shape_orig, brep_path, member_id)
-                object_type = f"{profile_match['Profile_type']} {profile_match['Designation']}"
+                object_type = f"{profile_match['Category']} {profile_match['Designation']}"
+                section_shape = f"{profile_match['Profile_type']}"
                 step_file = export_solid_to_step(refined_shape, step_path, member_id)
                 brep_fingerprint, brep_file = export_solid_to_brep(refined_shape, brep_path, member_id)
 
@@ -236,7 +276,9 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                      obj_type = object_type,
                      issues = str(e),
                      hash = hash,
-                     dxf_thumb_path = dxf_thumb_file
+                     dxf_thumb_path = dxf_thumb_file,
+                     section_shape = section_shape,
+                     assembly_hash = source_model_hash
                         )
 
 
@@ -256,13 +298,12 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                      obj_type = object_type,
                      issues = issues,
                      hash = hash,
-                     dxf_thumb_path = dxf_thumb_file
+                     dxf_thumb_path = dxf_thumb_file,
+                     section_shape = section_shape,
+                     assembly_hash = source_model_hash
                     )
 
     report_df = pd.DataFrame(report_rows)
-    # save_summary_table(summary_df, os.path.join(OUTPUT_DIR, "summary.html"))
-    print("\n✅ Pipeline completed. Summary saved.")
-    # report_df.to_excel('output.xlsx', sheet_name='Sheet1', index=False)
 
     # Create HTML report
     df_to_html_with_images(report_df, report_path, project_number)
@@ -270,6 +311,11 @@ def dstv_pipeline(root_model, project_number, matl_grade):
     # Log to Supabase
     report_for_db = normalize_report_df(report_df, project_number)
     dump_df_to_supabase(report_for_db)
+
+    print("\n✅ Pipeline completed. Summary saved.")
+    finish_time = datetime.now()
+    print(f"Finish Time : {finish_time}")
+    print(f"Processing Duration : {finish_time} - {start_time}")
 
 
 
@@ -294,11 +340,11 @@ if __name__ == "__main__":
     step16 = "TestUEAMirror.step"
     step17 = "TestPFC.step"
 
-    step_file = step1   
+    step_file = step5
     step_path = str(Path(home_path).joinpath(step_file))
 
     # project = "10206"
-    project = "10206"
+    project = "test"
     grade = "S355"
 
     dstv_pipeline(step_path, project, grade)

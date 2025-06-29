@@ -19,7 +19,9 @@ def record_solid(
     obj_type: str,
     issues: str,
     hash: str,
-    dxf_thumb_path : str
+    dxf_thumb_path : str,
+    section_shape : str,
+    assembly_hash : str,
     ):
     row = {
         "Item ID": name,
@@ -29,6 +31,7 @@ def record_solid(
         "Drilling Drawing": Path(rf"{drilling_path}"),
         "DXF Thumb": Path(rf"{dxf_thumb_path}"),
         "Profile DXF": Path(rf"{dxf_path}"),
+        "Section Shape": section_shape,
         "NC1 File": Path(rf"{nc1_path}"),
         "BREP": Path(rf"{brep_path}"),
         "Mass (kg)": mass,
@@ -36,7 +39,8 @@ def record_solid(
         "Y (mm)": obb_y,
         "Z (mm)": obb_z,
         "Issues": issues,
-        "Hash": hash
+        "Hash": hash,
+        "Assembly Hash" : assembly_hash
     }
     return report_rows.append(row)
 
@@ -108,7 +112,7 @@ def df_to_html_with_images(df, output_dir, project_number):
 </html>
 """
 
-    # print(f"Writing report to HTML at {html_path}")
+    print(f"✅ Writing report to HTML at {html_path}")
     html_path.write_text(html, encoding="utf-8")
 
 

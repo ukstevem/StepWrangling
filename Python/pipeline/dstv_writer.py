@@ -152,7 +152,6 @@ def generate_nc1_file(df_holes, header_data, nc_dir, web_cut) -> tuple[Path, str
             pass
         else:
         # BO blocks by face
-            print("Its getting by")
             for face in ['V', 'U', 'O']:
                 df_face = df_holes[df_holes['Code'] == face]
                 if df_face.empty:

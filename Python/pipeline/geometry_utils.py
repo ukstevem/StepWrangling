@@ -16,6 +16,9 @@ from OCC.Core.TopoDS import TopoDS_Shape
 
 from pathlib import Path
 import numpy as np
+import argparse
+import hashlib
+import os
 
 def robust_align_solid_from_geometry(solid, tol=1e-3):
     """
@@ -510,3 +513,4 @@ def refine_profile_orientation(shape, profile_match, obb_geom):
     else:
         print(f"ℹ️ No refinement needed for shape type '{shape_type}'")
         return shape, obb_geom  # ✅ This prevents the unpacking error
+
