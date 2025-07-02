@@ -411,27 +411,182 @@ def compute_dxf_fingerprint(dxf_path: Union[Path, str], tol: float = 0.01) -> st
     return hashlib.md5(ring.wkb).hexdigest()
 
 
-def export_profile_dxf_with_pca(shape,
-                                dxf_path: Union[Path, str],
-                                thumb_path: Optional[Union[Path, str]] = None,
-                                samples_per_curve: int = 16,
-                                fingerprint_tol: float = 0.01
-                                ) -> Tuple[str, Path, Path]:
-    """
-    Export a PCA-aligned DXF profile, generate a thumbnail, and fingerprint it.
+# def export_profile_dxf_with_pca(shape,
+#                                 dxf_path: Union[Path, str],
+#                                 thumb_path: Optional[Union[Path, str]] = None,
+#                                 samples_per_curve: int = 16,
+#                                 fingerprint_tol: float = 0.01
+#                                 ) -> Tuple[str, Path, Path]:
+#     """
+#     Export a PCA-aligned DXF profile, generate a thumbnail, and fingerprint it.
 
-    Args:
-      shape: OCC TopoDS_Shape to export
-      dxf_path: output DXF file path
-      thumb_path: optional base path for thumbnail (PNG). Defaults to same name as DXF.
-      samples_per_curve: number of points per curved edge
-      fingerprint_tol: rounding tolerance for fingerprint
+#     Args:
+#       shape: OCC TopoDS_Shape to export
+#       dxf_path: output DXF file path
+#       thumb_path: optional base path for thumbnail (PNG). Defaults to same name as DXF.
+#       samples_per_curve: number of points per curved edge
+#       fingerprint_tol: rounding tolerance for fingerprint
 
-    Returns:
-      fingerprint (str): MD5 hash of quantized profile
-      dxf_path (Path): Path to saved DXF
-      thumbnail_path (Path): Path to saved PNG thumbnail
+#     Returns:
+#       fingerprint (str): MD5 hash of quantized profile
+#       dxf_path (Path): Path to saved DXF
+#       thumbnail_path (Path): Path to saved PNG thumbnail
+#     """
+#     dxf_path = Path(dxf_path)
+#     samples_per_curve = int(samples_per_curve)
+
+#     # 1) Largest planar face
+#     best_face, best_area = None, 0.0
+#     exp = TopExp_Explorer(shape, TopAbs_FACE)
+#     while exp.More():
+#         f = exp.Current(); surf = BRepAdaptor_Surface(f)
+#         if surf.GetType() != 0:
+#             exp.Next(); continue
+#         props = GProp_GProps(); brepgprop.SurfaceProperties(f, props)
+#         area = props.Mass()
+#         if area > best_area:
+#             best_area, best_face = area, f
+#         exp.Next()
+#     if best_face is None:
+#         raise RuntimeError("No planar face found on shape")
+
+#     # 2) Boundary wires
+#     analyser = ShapeAnalysis_FreeBounds(best_face)
+#     bc = analyser.GetClosedWires(); wires = []
+#     we = TopExp_Explorer(bc, TopAbs_WIRE)
+#     while we.More(): wires.append(we.Current()); we.Next()
+#     if not wires:
+#         raise RuntimeError("No boundary wires found")
+
+#     # 3) Sample & project
+#     plane = BRepAdaptor_Surface(best_face).Plane()
+#     all_pts, segments = [], []
+#     for wire in wires:
+#         ee = TopExp_Explorer(wire, TopAbs_EDGE)
+#         while ee.More():
+#             edge = ee.Current(); adaptor = BRepAdaptor_Curve(edge)
+#             t0, t1 = adaptor.FirstParameter(), adaptor.LastParameter()
+#             if adaptor.GetType() == GeomAbs_Line:
+#                 params = [t0, t1]
+#             else:
+#                 params = np.linspace(float(t0), float(t1), samples_per_curve)
+#             uv = []
+#             for t in params:
+#                 org = plane.Location()
+#                 dx = gp_Vec(org, adaptor.Value(t)).Dot(gp_Vec(plane.XAxis().Direction()))
+#                 dy = gp_Vec(org, adaptor.Value(t)).Dot(gp_Vec(plane.YAxis().Direction()))
+#                 uv.append((dx, dy))
+#             all_pts.extend(uv)
+#             segments.extend(zip(uv[:-1], uv[1:]))
+#             ee.Next()
+#     if not segments:
+#         raise RuntimeError("No segments generated from shape")
+
+#     # 4) PCA rotation (right-handed)
+#     pts = np.vstack(all_pts); center = pts.mean(axis=0)
+#     cov = np.cov((pts-center).T)
+#     vals, vecs = np.linalg.eigh(cov)
+#     idx = np.argsort(vals)[::-1]
+#     R = vecs[:,idx].T
+#     if np.linalg.det(R) < 0:
+#         R[1,:] *= -1
+
+#     # 5) Rotate segments
+#     rotated = []
+#     for (x1,y1),(x2,y2) in segments:
+#         p1 = R.dot(np.array([x1,y1]) - center)
+#         p2 = R.dot(np.array([x2,y2]) - center)
+#         rotated.append((tuple(p1), tuple(p2)))
+
+#     # 6) Write DXF
+#     doc = ezdxf.new(dxfversion="R2010"); msp = doc.modelspace()
+#     for (u1,v1),(u2,v2) in rotated:
+#         msp.add_line((u1,v1),(u2,v2))
+#     doc.saveas(str(dxf_path))
+#     # print(f"Wrote PCA-aligned DXF → {dxf_path}")
+
+#     # 7) Thumbnail
+#     thumb_base = Path(thumb_path) if thumb_path else dxf_path.with_suffix('')
+#     thumbnail_path = thumb_base.with_suffix('.png')
+#     def _manual(path):
+#         try:
+#             import matplotlib.pyplot as plt
+#         except ImportError:
+#             print("matplotlib not installed; cannot generate thumbnail")
+#             return
+#         fig, ax = plt.subplots(); fig.patch.set_facecolor('white'); ax.set_facecolor('white')
+#         for (x1,y1),(x2,y2) in rotated:
+#             ax.plot([x1,x2],[y1,y2],'k-',linewidth=0.8)
+#         ax.set_aspect('equal'); ax.axis('off')
+#         fig.savefig(path, dpi=150, bbox_inches='tight', pad_inches=0, transparent=False)
+#         plt.close(fig)
+#     if qsave:
+#         try:
+#             qsave(msp, str(thumbnail_path), bg='#FFFFFF', fg='#000000')
+#             print(f"Saved thumbnail via qsave → {thumbnail_path}")
+#         except Exception as e:
+#             print(f"qsave failed: {e}, falling back to manual thumbnail")
+#             _manual(thumbnail_path)
+#     else:
+#         print("ezdxf matplotlib extension not installed; using manual thumbnail")
+#         _manual(thumbnail_path)
+
+#     # 8) Fingerprint
+#     fp = compute_dxf_fingerprint(dxf_path, tol=fingerprint_tol)
+#     print(f"✅ DXF saved to {dxf_path}")
+#     return fp, dxf_path, thumbnail_path
+
+
+
+
+def _compute_edge_axes(segments, perp_tol=1e-3, share_tol=1e-6):
     """
+    Given a list of 2D segments [((x1,y1),(x2,y2)),…], returns the first
+    perpendicular pair found when scanning edges by descending length.
+    Returns (x_axis, y_axis) as unit vectors, or (None, None) if none found.
+    """
+    info = []
+    for p1, p2 in segments:
+        P, Q = np.array(p1), np.array(p2)
+        v = Q - P
+        L = np.linalg.norm(v)
+        if L < share_tol:
+            continue
+        info.append((L, v / L, P, Q))
+
+    # sort by length descending
+    info.sort(key=lambda x: x[0], reverse=True)
+
+    # scan for first (longer edge, shorter perpendicular neighbor)
+    for Lx, vx, Ax, Bx in info:
+        for Ly, vy, Py, Qy in info:
+            if Ly >= Lx:
+                continue
+            # must share an endpoint
+            if not (
+                np.allclose(Py, Ax, atol=share_tol) or
+                np.allclose(Qy, Ax, atol=share_tol) or
+                np.allclose(Py, Bx, atol=share_tol) or
+                np.allclose(Qy, Bx, atol=share_tol)
+            ):
+                continue
+            # check perpendicularity
+            if abs(np.dot(vx, vy)) <= perp_tol:
+                # enforce right-handed (2D cross-product > 0)
+                if np.cross(vx, vy) < 0:
+                    vy = -vy
+                return vx, vy
+
+    return None, None
+
+
+def export_profile_dxf_with_pca(
+    shape,
+    dxf_path: Union[Path, str],
+    thumb_path: Optional[Union[Path, str]] = None,
+    samples_per_curve: int = 16,
+    fingerprint_tol: float = 0.01
+) -> Tuple[str, Path, Path]:
     dxf_path = Path(dxf_path)
     samples_per_curve = int(samples_per_curve)
 
@@ -439,100 +594,141 @@ def export_profile_dxf_with_pca(shape,
     best_face, best_area = None, 0.0
     exp = TopExp_Explorer(shape, TopAbs_FACE)
     while exp.More():
-        f = exp.Current(); surf = BRepAdaptor_Surface(f)
-        if surf.GetType() != 0:
-            exp.Next(); continue
-        props = GProp_GProps(); brepgprop.SurfaceProperties(f, props)
+        f = exp.Current()
+        surf = BRepAdaptor_Surface(f)
+        if surf.GetType() != 0:  # not a plane
+            exp.Next()
+            continue
+        props = GProp_GProps()
+        brepgprop.SurfaceProperties(f, props)
         area = props.Mass()
         if area > best_area:
             best_area, best_face = area, f
         exp.Next()
+
     if best_face is None:
         raise RuntimeError("No planar face found on shape")
 
-    # 2) Boundary wires
-    analyser = ShapeAnalysis_FreeBounds(best_face)
-    bc = analyser.GetClosedWires(); wires = []
-    we = TopExp_Explorer(bc, TopAbs_WIRE)
-    while we.More(): wires.append(we.Current()); we.Next()
-    if not wires:
-        raise RuntimeError("No boundary wires found")
+    # 2–5) Sample only true in-plane edges using the face's normal
+    surf = BRepAdaptor_Surface(best_face)
+    pln = surf.Plane()
+    origin = np.array([
+        pln.Location().X(),
+        pln.Location().Y(),
+        pln.Location().Z()
+    ])
+    xdir3 = np.array([
+        pln.XAxis().Direction().X(),
+        pln.XAxis().Direction().Y(),
+        pln.XAxis().Direction().Z()
+    ])
+    ydir3 = np.array([
+        pln.YAxis().Direction().X(),
+        pln.YAxis().Direction().Y(),
+        pln.YAxis().Direction().Z()
+    ])
+    zdir3 = np.array([
+        pln.Axis().Direction().X(),
+        pln.Axis().Direction().Y(),
+        pln.Axis().Direction().Z()
+    ])  # face normal
 
-    # 3) Sample & project
-    plane = BRepAdaptor_Surface(best_face).Plane()
     all_pts, segments = [], []
-    for wire in wires:
+    we = TopExp_Explorer(best_face, TopAbs_WIRE)
+    while we.More():
+        wire = we.Current()
         ee = TopExp_Explorer(wire, TopAbs_EDGE)
         while ee.More():
-            edge = ee.Current(); adaptor = BRepAdaptor_Curve(edge)
+            edge = ee.Current()
+            adaptor = BRepAdaptor_Curve(edge)
             t0, t1 = adaptor.FirstParameter(), adaptor.LastParameter()
             if adaptor.GetType() == GeomAbs_Line:
-                params = [t0, t1]
+                ts = [t0, t1]
             else:
-                params = np.linspace(float(t0), float(t1), samples_per_curve)
-            uv = []
-            for t in params:
-                org = plane.Location()
-                dx = gp_Vec(org, adaptor.Value(t)).Dot(gp_Vec(plane.XAxis().Direction()))
-                dy = gp_Vec(org, adaptor.Value(t)).Dot(gp_Vec(plane.YAxis().Direction()))
-                uv.append((dx, dy))
-            all_pts.extend(uv)
-            segments.extend(zip(uv[:-1], uv[1:]))
+                ts = np.linspace(float(t0), float(t1), samples_per_curve)
+
+            # sample 3D points
+            pts3d = []
+            for t in ts:
+                p = adaptor.Value(t)
+                pts3d.append(np.array([p.X(), p.Y(), p.Z()]))
+
+            # filter & project segments
+            for P3, Q3 in zip(pts3d, pts3d[1:]):
+                v3 = Q3 - P3
+                L3 = np.linalg.norm(v3)
+                if L3 < 1e-9:
+                    continue
+                # drop thickness edges
+                if abs(np.dot(v3 / L3, zdir3)) > 1e-3:
+                    continue
+
+                # project into 2D face plane
+                for Qp in (P3, Q3):
+                    d = Qp - origin
+                    all_pts.append((d.dot(xdir3), d.dot(ydir3)))
+                segments.append((all_pts[-2], all_pts[-1]))
             ee.Next()
+        we.Next()
+
     if not segments:
-        raise RuntimeError("No segments generated from shape")
+        raise RuntimeError("No in-plane segments found – check face sampling")
 
-    # 4) PCA rotation (right-handed)
-    pts = np.vstack(all_pts); center = pts.mean(axis=0)
-    cov = np.cov((pts-center).T)
-    vals, vecs = np.linalg.eigh(cov)
-    idx = np.argsort(vals)[::-1]
-    R = vecs[:,idx].T
-    if np.linalg.det(R) < 0:
-        R[1,:] *= -1
+    # 6) Try longest+perpendicular rule
+    x_axis, y_axis = _compute_edge_axes(segments)
 
-    # 5) Rotate segments
-    rotated = []
-    for (x1,y1),(x2,y2) in segments:
-        p1 = R.dot(np.array([x1,y1]) - center)
-        p2 = R.dot(np.array([x2,y2]) - center)
-        rotated.append((tuple(p1), tuple(p2)))
+    # 7) Fall back to in-plane PCA if no perp pair
+    pts2 = np.vstack(all_pts)
+    center2d = pts2.mean(axis=0)
+    if x_axis is None:
+        cov2 = np.cov((pts2 - center2d).T)
+        vals2, vecs2 = np.linalg.eigh(cov2)
+        idx2 = np.argsort(vals2)[::-1]
+        R = vecs2[:, idx2].T
+        if np.linalg.det(R) < 0:
+            R[1, :] *= -1
+    else:
+        R = np.vstack([x_axis, y_axis])
 
-    # 6) Write DXF
-    doc = ezdxf.new(dxfversion="R2010"); msp = doc.modelspace()
-    for (u1,v1),(u2,v2) in rotated:
-        msp.add_line((u1,v1),(u2,v2))
+    # 8) Rotate & write DXF
+    doc = ezdxf.new(dxfversion="R2010")
+    msp = doc.modelspace()
+    for (u1, v1), (u2, v2) in segments:
+        p1 = R.dot(np.array([u1, v1]) - center2d)
+        p2 = R.dot(np.array([u2, v2]) - center2d)
+        msp.add_line(tuple(p1), tuple(p2))
     doc.saveas(str(dxf_path))
-    # print(f"Wrote PCA-aligned DXF → {dxf_path}")
 
-    # 7) Thumbnail
+    # 9) Thumbnail (manual + qsave fallback)
     thumb_base = Path(thumb_path) if thumb_path else dxf_path.with_suffix('')
     thumbnail_path = thumb_base.with_suffix('.png')
+
     def _manual(path):
         try:
             import matplotlib.pyplot as plt
         except ImportError:
-            print("matplotlib not installed; cannot generate thumbnail")
             return
-        fig, ax = plt.subplots(); fig.patch.set_facecolor('white'); ax.set_facecolor('white')
-        for (x1,y1),(x2,y2) in rotated:
-            ax.plot([x1,x2],[y1,y2],'k-',linewidth=0.8)
-        ax.set_aspect('equal'); ax.axis('off')
+        fig, ax = plt.subplots()
+        fig.patch.set_facecolor('white')
+        ax.set_facecolor('white')
+        for (u1, v1), (u2, v2) in segments:
+            p1 = R.dot(np.array([u1, v1]) - center2d)
+            p2 = R.dot(np.array([u2, v2]) - center2d)
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], 'k-', linewidth=0.8)
+        ax.set_aspect('equal')
+        ax.axis('off')
         fig.savefig(path, dpi=150, bbox_inches='tight', pad_inches=0, transparent=False)
         plt.close(fig)
-    if qsave:
+
+    if 'qsave' in globals() and qsave:
         try:
             qsave(msp, str(thumbnail_path), bg='#FFFFFF', fg='#000000')
-            print(f"Saved thumbnail via qsave → {thumbnail_path}")
-        except Exception as e:
-            print(f"qsave failed: {e}, falling back to manual thumbnail")
+        except Exception:
             _manual(thumbnail_path)
     else:
-        print("ezdxf matplotlib extension not installed; using manual thumbnail")
         _manual(thumbnail_path)
 
-    # 8) Fingerprint
+    # 10) Fingerprint
     fp = compute_dxf_fingerprint(dxf_path, tol=fingerprint_tol)
-    print(f"✅ DXF saved to {dxf_path}")
-    return fp, dxf_path, thumbnail_path
 
+    return fp, dxf_path, thumbnail_path

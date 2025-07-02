@@ -12,8 +12,8 @@ from pipeline.geometry_utils import (robust_align_solid_from_geometry,
                                      swap_width_and_height_if_required,
                                      compute_dstv_origin,
                                      align_obb_to_dstv_frame,
-                                     refine_profile_orientation
-                                    )
+                                     refine_profile_orientation)
+
 from pipeline.assembly_management import (
                                      fingerprint_solids
                                      )
@@ -76,6 +76,7 @@ def dstv_pipeline(root_model, project_number, matl_grade):
     # compute an MD5 of the newly written STEP
     hash_type = 'md5'
     source_model_hash = fingerprint_solids(solids, str(cad_file), hash_type)
+
     #write data to source_model table
         #todo
 
@@ -186,27 +187,35 @@ def dstv_pipeline(root_model, project_number, matl_grade):
 
                 print(f"🔄 Post-swap extents: {obb_geom['aligned_extents']}")
 
-                # STEP 7: Compute DSTV origin and align
+                step_vals = profile_match["STEP"]
+                
+                # generic DSTV frame for beams/channels
                 origin_local = compute_dstv_origin(
                     obb_geom["aligned_center"],
                     obb_geom["aligned_extents"],
                     obb_geom["aligned_dir_x"],
                     obb_geom["aligned_dir_y"],
-                    obb_geom["aligned_dir_z"]
+                    obb_geom["aligned_dir_z"],
                 )
-
-                primary_aligned_shape, trsf = align_obb_to_dstv_frame(
+                primary_aligned_shape, _ = align_obb_to_dstv_frame(
                     primary_aligned_shape,
                     origin_local,
                     obb_geom["aligned_dir_x"],
                     obb_geom["aligned_dir_y"],
-                    obb_geom["aligned_dir_z"]
+                    obb_geom["aligned_dir_z"],
+                )
+                dstv_frame = gp_Ax3(
+                    gp_Pnt(0, 0, 0),
+                    gp_Dir(obb_geom["aligned_dir_z"].XYZ()),  # thickness
+                    gp_Dir(obb_geom["aligned_dir_x"].XYZ()),  # length
                 )
 
                 # STEP 8: Final orientation refinement
                 refined_shape, obb_geom = refine_profile_orientation(
                     primary_aligned_shape, profile_match, compute_obb_geometry(primary_aligned_shape)
                 )
+
+                obb_geom = compute_obb_geometry(refined_shape)
 
                 print(f"✅ Orientation refinement complete. New extents: {obb_geom['aligned_extents']}")
 
@@ -217,6 +226,13 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                 step_file = export_solid_to_step(refined_shape, step_path, member_id)
                 brep_fingerprint, brep_file = export_solid_to_brep(refined_shape, brep_path, member_id)
 
+                # after refine_profile_orientation and compute_obb_geometry
+                print(">>> OBB extents (L, H, W):", obb_geom["aligned_extents"])
+                for axis_name in ["x", "y", "z"]:
+                    vec = obb_geom[f"aligned_dir_{axis_name}"]
+                    xyz = vec.XYZ()
+                    print(f">>> aligned_dir_{axis_name}: "
+                        f"({xyz.X():.6f}, {xyz.Y():.6f}, {xyz.Z():.6f})")
 
                 ## define the DSTV frame and axis direction from geometry
                 dstv_frame = gp_Ax3(
@@ -241,7 +257,7 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                 obb_y = f'{step_vals["height"]:.2f}'
                 obb_z = f'{step_vals["width"]:.2f}'
                 step_mass = f'{step_vals["mass"]:.0f}'
-                # print(raw_df_holes)
+                print(raw_df_holes)
 
                 check_duplicate_holes(raw_df_holes, tolerance=0.5)
 
@@ -315,7 +331,7 @@ def dstv_pipeline(root_model, project_number, matl_grade):
     print("\n✅ Pipeline completed. Summary saved.")
     finish_time = datetime.now()
     print(f"Finish Time : {finish_time}")
-    print(f"Processing Duration : {finish_time} - {start_time}")
+    print(f"Processing Duration : {finish_time - start_time}")
 
 
 
@@ -339,12 +355,17 @@ if __name__ == "__main__":
     step15 = "TestUEA.step"
     step16 = "TestUEAMirror.step"
     step17 = "TestPFC.step"
+    step18 = "MEM-0027.step"     #Misaligned plate
+    step19 = "MEM-0057.step"     #Misaligned Plate 2
+    step20 = "02086 - Steelwork.stp"
+    step21 = "MEM-0001.step"    #02086 - Imported Channel Ident issue"
+    step22 = "MEM-1181.step"
 
-    step_file = step5
+    step_file = step22
     step_path = str(Path(home_path).joinpath(step_file))
 
     # project = "10206"
     project = "test"
-    grade = "S355"
+    grade = "S275"
 
     dstv_pipeline(step_path, project, grade)

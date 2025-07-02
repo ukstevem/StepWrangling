@@ -251,7 +251,7 @@ def compute_section_area(solid, axis_dir=gp_Dir(1, 0, 0), sample_pos=None, tol=1
         face_maker.Add(wire)
         props = GProp_GProps()
         brepgprop.SurfaceProperties(face_maker.Face(), props)
-        return props.Mass()
+        return abs(props.Mass())
     except Exception:
         # Fallback: approximate as volume/length
         vol_props = GProp_GProps()

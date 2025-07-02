@@ -11,13 +11,14 @@ def assemble_dstv_header_data(project_number, step_path, matl_grade, member_id, 
     model_filename = f"{filename_stem}.step"
 
     step_vals = profile_match["STEP"]
+    # print(profile_match)
 
     header_dict = {
         "project_number": project_number,
         "model_filename": model_filename,
         "material_grade": matl_grade,
         "quantity": 1,
-        "Designation": profile_match["Designation"],
+        "Designation": f'{profile_match["Category"]}{profile_match["Designation"]}',
         "Mass": step_vals["mass"],
         "Height": step_vals["height"],
         "Width": step_vals["width"],
@@ -32,65 +33,6 @@ def assemble_dstv_header_data(project_number, step_path, matl_grade, member_id, 
     }
 
     return header_dict
-
-# def generate_nc1_file(df_holes, header_data, nc_path):
-
-#     """
-#     Write DSTV NC1 ST-block header to .nc1 file with specified order
-#     """
-#     faces = ['V', 'U', 'O']  #Face priority order
-
-#     filename = f"{nc_path}\{header_data['out_filename']}.nc1"
-#     with open(filename, 'w') as f:
-#         f.write('ST\n')
-#         f.write(f"  {header_data['project_number']}\n")
-#         f.write(f"  {header_data['model_filename']}\n")
-#         f.write(f"  Drill-Cut\n")
-#         f.write(f"  {header_data['out_filename']}\n")
-#         f.write(f"  {header_data['material_grade']}\n")
-#         f.write(f"  {header_data['quantity']}\n")
-#         f.write(f"  {header_data['Designation']}\n")
-#         f.write(f"  {header_data['code_profile']}\n")
-#         f.write(f"    {header_data['Length']:8.2f}\n")
-#         f.write(f"    {header_data['Height']:8.2f}\n")
-#         f.write(f"    {header_data['Width']:8.2f}\n")
-#         f.write(f"    {header_data['flange_thickness']:8.2f}\n")
-#         f.write(f"    {header_data['web_thickness']:8.2f}\n")
-#         f.write(f"    {header_data['root_radius']:8.2f}\n")
-#         f.write(f"    {header_data['Mass']:8.2f}\n")
-#         f.write('        0.00\n') #surface area
-#         # Following the spec, three zeros
-#         f.write('        0.00\n')
-#         f.write('        0.00\n')
-#         f.write('        0.00\n')
-#         f.write('        0.00\n')
-#         f.write('  -\n')
-#         f.write('  -\n')
-#         f.write('  -\n')
-#         f.write('  -\n')
-        
-#         # BO blocks by face
-#         for face in faces:
-#             df_face = df_holes[df_holes['Code'] == face]
-#             if df_face.empty:
-#                 continue
-#             f.write('BO\n')
-#             for _, row in df_face.iterrows():
-#                 x = row['X (mm)']
-#                 y = row['Y (mm)']
-#                 d = row['Diameter (mm)']
-#                 # Right-align numeric columns: x, y (8-wide), diameter (6-wide)
-#                 f.write(f"  {face.lower()}  {x:8.2f} {y:8.2f} {d:6.2f}\n")
-                
-#         f.write('EN\n')
-
-#         nc1_hash = nc1_group_key(filename)
-
-#     print(f"DSTV written to {filename}")
-
-
-#     return filename, nc1_hash
-
 
 import hashlib
 from pathlib import Path
