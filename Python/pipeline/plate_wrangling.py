@@ -89,12 +89,30 @@ def align_plate_to_xy_plane(solid):
         if fn is None:
             return False, solid, None, thickness_mm, length_mm, width_mm, step_mass, "Could not determine face normal"
 
-        # 4) Build DSTV axes (force correct types)
-        cx = gp_Pnt(center.X(), center.Y(), center.Z())
-        raw_x = axes[length_idx]
-        zx = gp_Dir(fn.X(), fn.Y(), fn.Z()).Reversed()
-        xx = gp_Dir(raw_x.X(), raw_x.Y(), raw_x.Z())
-        yy = xx.Crossed(zx)
+        # 4) Build DSTV axes (robustly)
+        cx     = gp_Pnt(center.X(), center.Y(), center.Z())
+        fn_dir = gp_Dir(fn.X(), fn.Y(), fn.Z())
+        zx     = fn_dir.Reversed()
+
+        # Try the OBB’s long‐axis, but detect if it’s colinear with the normal
+        raw_axes = [axes[length_idx],
+                    axes[width_idx],
+                    axes[thickness_idx]]
+
+        xx = None
+        for v in raw_axes:
+            cand = gp_Dir(v.X(), v.Y(), v.Z())
+            # if cand not (anti‐)parallel to zx, keep it
+            if abs(cand.Dot(zx)) < 1.0 - 1e-6:
+                xx = cand
+                break
+
+        # fallback: pick *any* vector perpendicular to zx
+        if xx is None:
+            # zx.XDirection() is guaranteed perpendicular to zx
+            xx = zx.XDirection()
+
+        # now build the frame
         dstv_ax3 = gp_Ax3(cx, zx, xx)
 
         # 5) Transform into world XY plane

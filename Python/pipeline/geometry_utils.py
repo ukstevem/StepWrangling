@@ -74,11 +74,14 @@ def robust_align_solid_from_geometry(solid, tol=1e-3):
     surf_adapt = BRepAdaptor_Surface(largest_face)
     if surf_adapt.GetType() != 0:
         raise RuntimeError("Largest face is not planar.")
-    dir_y = surf_adapt.Plane().Axis().Direction()
+    # dir_y = surf_adapt.Plane().Axis().Direction()
+    dir_z = surf_adapt.Plane().Axis().Direction()
 
     # Step 4: Orthonormalize axes
-    dir_z = dir_x.Crossed(dir_y)
+    # dir_z = dir_x.Crossed(dir_y)
+    # dir_y = dir_z.Crossed(dir_x)
     dir_y = dir_z.Crossed(dir_x)
+    dir_x = dir_y.Crossed(dir_z)
 
     # Step 5: Build transformation
     origin = gp_Pnt(0, 0, 0)
@@ -376,6 +379,80 @@ def align_obb_to_dstv_frame(shape, origin_local, dir_x, dir_y, dir_z):
 
     return shape_rotated, trsf_rotate
 
+# from OCC.Core.gp import gp_Pnt, gp_Vec, gp_Dir, gp_Ax3, gp_Trsf
+# from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform
+
+# Assumes ensure_right_handed is defined elsewhere and imported
+
+# def align_obb_to_dstv_frame(shape,
+#                             origin_local,
+#                             dir_x,
+#                             dir_y,
+#                             dir_z,
+#                             section_type=None,
+#                             properties=None):
+#     """
+#     Align a solid into the DSTV frame:
+#     1. Translate origin_local to (0, 0, 0).
+#     2. Rotate axes to DSTV standard (X=length, Y=height, Z=thickness).
+#     3. For angle sections, enforce right-handedness and shift the external corner to the origin.
+
+#     Parameters:
+#     - shape: OCC shape to transform
+#     - origin_local: gp_Pnt, local rear-bottom-left corner
+#     - dir_x, dir_y, dir_z: gp_Dir, principal axes
+#     - section_type: str, one of 'beam', 'channel', or 'angle'
+#     - properties: dict, must contain 'width' and 'height' for angles
+
+#     Returns:
+#     - Transformed shape
+#     - Composite transformation gp_Trsf
+#     """
+#     # STEP 1: translate shape so origin_local → (0,0,0)
+#     translate_vec = gp_Vec(origin_local, gp_Pnt(0, 0, 0))
+#     trsf_translate = gp_Trsf()
+#     trsf_translate.SetTranslation(translate_vec)
+#     shape_translated = BRepBuilderAPI_Transform(shape, trsf_translate, True).Shape()
+
+#     # STEP 2: rotate to align local frame with DSTV global frame
+#     local_frame = gp_Ax3(gp_Pnt(0, 0, 0), dir_z, dir_x)
+#     dstv_frame = gp_Ax3(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), gp_Dir(1, 0, 0))
+#     trsf_rotate = gp_Trsf()
+#     trsf_rotate.SetDisplacement(local_frame, dstv_frame)
+#     shape_rotated = BRepBuilderAPI_Transform(shape_translated, trsf_rotate, True).Shape()
+
+#                 # STEP 3: L-section handling by recomputing axis-aligned bounding box
+#     if section_type == 'angle':
+#         # Enforce right-handed coordinate system via existing helper
+#         dir_x, dir_y, dir_z = ensure_right_handed(dir_x, dir_y, dir_z)
+
+#         # --- Recompute axis-aligned bounding box on the rotated shape
+#         from OCC.Core.Bnd import Bnd_Box
+#         from OCC.Core.BRepBndLib import brepbndlib_Add
+
+#         bb = Bnd_Box()
+#         brepbndlib_Add(shape_rotated, bb)
+#         xmin, ymin, zmin, xmax, ymax, zmax = bb.Get()
+
+#         # External convex corner: (xmax, ymax, zmin)
+#         external_pt = gp_Pnt(xmax, ymax, zmin)
+
+#         # Translate that corner to the origin
+#         shift_vec = gp_Vec(external_pt, gp_Pnt(0, 0, 0))
+#         trsf_extra = gp_Trsf()
+#         trsf_extra.SetTranslation(shift_vec)
+#         shape_rotated = BRepBuilderAPI_Transform(shape_rotated, trsf_extra, True).Shape()
+#         trsf_rotate.Multiply(trsf_extra)
+
+#                 # Note: for L-sections, after shifting the external corner, we intentionally allow negative interior coordinates,
+# # so we do not further translate minima to zero. This preserves correct relative hole positions.
+
+#         # Note: downstream export routines should use the current `shape_rotated` and `trsf_rotate`
+
+#         # Note: downstream export routines should use the current `shape_rotated` and `trsf_rotate`
+
+#     return shape_rotated, trsf_rotate
+
 
 
 def rotate_shape_around_axis(shape, center, axis_dir, angle_rad):
@@ -401,7 +478,7 @@ def rotate_shape_around_axis(shape, center, axis_dir, angle_rad):
 
 
 
-def refine_orientation_by_flange_face(shape, obb_geom, face_normal_dir, position_dir, axis_label="Y", profile_type="U"):
+def refine_orientation_by_flange_face(shape, obb_geom, face_normal_dir, position_dir, axis_label="Y", profile_type="U", shape_category=""):
     """
     Generic version for both channels and angles. Detects orientation by evaluating the largest face
     facing `face_normal_dir` (e.g. Z for channel flanges), and checking its centroid position along `position_dir`.
@@ -475,9 +552,59 @@ def refine_orientation_by_flange_face(shape, obb_geom, face_normal_dir, position
         if profile_type == "Channel":
             print(f"🔁 {profile_type} is reversed — rotating 180° around X axis")
             shape, trsf = rotate_shape_around_axis(shape, obb_geom["aligned_center"], obb_geom["aligned_dir_x"], np.pi)
-        elif profile_type == "Angle":
-            print(f"🔁 {profile_type} is reversed — rotating 180° around Z axis")
-            shape, trsf = rotate_shape_around_axis(shape, obb_geom["aligned_center"], obb_geom["aligned_dir_z"], np.pi)
+        elif profile_type == "Angle" and shape_category != "EA":
+            print(f"🔁 {profile_type} is reversed — translating to origin")
+            # 5) recompute the OBB so we have up-to-date center, axes & extents
+            obb_geom = compute_obb_geometry(shape)
+
+            # extract as numpy arrays
+            center_vec = np.array([
+                obb_geom["aligned_center"].X(),
+                obb_geom["aligned_center"].Y(),
+                obb_geom["aligned_center"].Z()
+            ])
+
+            dir_x = np.array([
+                obb_geom["aligned_dir_x"].X(),
+                obb_geom["aligned_dir_x"].Y(),
+                obb_geom["aligned_dir_x"].Z(),
+            ])
+            dir_y = np.array([
+                obb_geom["aligned_dir_y"].X(),
+                obb_geom["aligned_dir_y"].Y(),
+                obb_geom["aligned_dir_y"].Z(),
+            ])
+            dir_z = np.array([
+                obb_geom["aligned_dir_z"].X(),
+                obb_geom["aligned_dir_z"].Y(),
+                obb_geom["aligned_dir_z"].Z(),
+            ])
+
+            extents = np.array(obb_geom["aligned_extents"])  # [dx, dy, dz]
+
+            # compute the minimum-corner of the OBB
+            half = extents * 0.5
+            min_corner = (
+                center_vec
+                - half[0] * dir_x
+                - half[1] * dir_y
+                - half[2] * dir_z
+            )
+
+            # 6) translate that min-corner to the global origin
+            translation = gp_Trsf()
+            translation.SetTranslation(
+                gp_Vec(
+                    gp_Pnt(min_corner[0], min_corner[1], min_corner[2]),
+                    gp_Pnt(0.0, 0.0, 0.0)
+                )
+            )
+            shape = BRepBuilderAPI_Transform(shape, translation, True).Shape()
+
+            # 7) recompute OBB one last time so obb_geom is in the new frame
+            obb_geom = compute_obb_geometry(shape)
+            return shape, obb_geom
+
         else:
             print(f"⚠️ No rotation logic defined for profile type '{profile_type}'")
             obb_geom = compute_obb_geometry(shape)
@@ -489,6 +616,8 @@ def refine_orientation_by_flange_face(shape, obb_geom, face_normal_dir, position
 
 def refine_profile_orientation(shape, profile_match, obb_geom):
     shape_type = profile_match.get("Profile_type")
+    shape_category = profile_match.get("Category")
+    # print(profile_match)
 
     if shape_type == "L":
         print("🔍 Refining angle orientation")
@@ -497,7 +626,8 @@ def refine_profile_orientation(shape, profile_match, obb_geom):
         face_normal_dir=obb_geom["aligned_dir_z"],
         position_dir=obb_geom["aligned_dir_y"],
         axis_label="Y",
-        profile_type="Angle"
+        profile_type="Angle",
+        shape_category = shape_category
         )
 
     elif shape_type == "U":
@@ -507,10 +637,11 @@ def refine_profile_orientation(shape, profile_match, obb_geom):
             face_normal_dir=obb_geom["aligned_dir_z"],
             position_dir=obb_geom["aligned_dir_y"],
             axis_label="Y",
-            profile_type="Channel"
+            profile_type="Channel",
+            shape_category = shape_category
         )
 
     else:
         print(f"ℹ️ No refinement needed for shape type '{shape_type}'")
-        return shape, obb_geom  # ✅ This prevents the unpacking error
+        return shape, obb_geom
 

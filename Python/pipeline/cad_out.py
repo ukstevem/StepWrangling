@@ -585,7 +585,7 @@ def export_profile_dxf_with_pca(
     dxf_path: Union[Path, str],
     thumb_path: Optional[Union[Path, str]] = None,
     samples_per_curve: int = 16,
-    fingerprint_tol: float = 0.01
+    fingerprint_tol: float = 0.5
 ) -> Tuple[str, Path, Path]:
     dxf_path = Path(dxf_path)
     samples_per_curve = int(samples_per_curve)

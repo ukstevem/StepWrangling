@@ -7,7 +7,8 @@ def assemble_dstv_header_data(project_number, step_path, matl_grade, member_id, 
     Assembles header data dictionary for DSTV NC1 file.
     """
     filename_stem = Path(step_path).stem
-    out_filename = f"{filename_stem}-{member_id}"
+    # out_filename = f"{filename_stem}-{member_id}"
+    out_filename = f"{member_id}"
     model_filename = f"{filename_stem}.step"
 
     step_vals = profile_match["STEP"]
@@ -48,7 +49,6 @@ def nc1_group_key(nc1_path: Path | str, skip_first: int = 5) -> str:
     text = p.read_text(encoding="utf-8").replace("\r\n", "\n")
     lines = text.split("\n")
 
-    # drop the first `skip_first` lines
     relevant = lines[skip_first:]
     # if you want to preserve a trailing newline, you can do:
     # data = "\n".join(relevant) + "\n"
@@ -64,6 +64,13 @@ def generate_nc1_file(df_holes, header_data, nc_dir, web_cut) -> tuple[Path, str
     nc_dir = Path(nc_dir)
     nc_dir.mkdir(parents=True, exist_ok=True)
 
+    all_zero = all(x == 0 for x in (web_cut['start_web'], web_cut['end_web'], web_cut['start_flange'], web_cut['end_flange']))
+
+    if all_zero:
+        process_step = ("Drill")
+    else:
+        process_step = ("Drill & End Mitre")
+
     out_file = nc_dir / f"{header_data['out_filename']}.nc1"
 
     # Write with explicit '\n' line endings:
@@ -71,7 +78,7 @@ def generate_nc1_file(df_holes, header_data, nc_dir, web_cut) -> tuple[Path, str
         f.write("ST\n")
         f.write(f"  {header_data['project_number']}\n")
         f.write(f"  {header_data['model_filename']}\n")
-        f.write("  Drill-Cut\n")
+        f.write(f"  {process_step}\n")
         f.write(f"  {header_data['out_filename']}\n")
         f.write(f"  {header_data['material_grade']}\n")
         f.write(f"  {header_data['quantity']}\n")
@@ -103,7 +110,7 @@ def generate_nc1_file(df_holes, header_data, nc_dir, web_cut) -> tuple[Path, str
                     x = row['X (mm)']
                     y = row['Y (mm)']
                     d = row['Diameter (mm)']
-                    f.write(f"  {face.lower()}  {x:8.2f} {y:8.2f} {d:6.2f}\n")
+                    f.write(f"  {face.lower()}  {x:8.2f}o {y:8.2f} {d:6.2f}\n")
 
         f.write("EN\n")
 

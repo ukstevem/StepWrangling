@@ -3,7 +3,6 @@
 from datetime import datetime
 import os
 import pandas as pd
-import numpy as np
 from datetime import datetime
 from pipeline.step_loader import load_step_file
 from pipeline.geometry_utils import (robust_align_solid_from_geometry, 
@@ -14,7 +13,7 @@ from pipeline.geometry_utils import (robust_align_solid_from_geometry,
                                      compute_dstv_origin,
                                      align_obb_to_dstv_frame,
                                      refine_profile_orientation)
-from pipeline.shape_inspector import (describe_shape)
+
 from pipeline.assembly_management import (
                                      fingerprint_solids
                                      )
@@ -79,6 +78,8 @@ def dstv_pipeline(root_model, project_number, matl_grade):
     source_model_hash = fingerprint_solids(solids, str(cad_file), hash_type)
 
     #write data to source_model table
+        #todo
+
     # now insert a row into `source_model`
     payload = {
         "filename": Path(root_model).name,
@@ -124,20 +125,18 @@ def dstv_pipeline(root_model, project_number, matl_grade):
 
         try:
 
-            # print("=== Original Shape ===")
-            # metrics0 = describe_shape(shape_orig)
+            # Thumbnail
+            thumbnail_file = shape_to_thumbnail(shape_orig, thumb_path, member_id)
 
             # STEP 1: Align to major geometry
             primary_aligned_shape, trsf, cs, largest_face, dir_x, dir_y, dir_z = robust_align_solid_from_geometry(shape_orig)
             dir_x, dir_y, dir_z = ensure_right_handed(dir_x, dir_y, dir_z)
 
-            # print("=== Primary Aligned Shape ===")
-            # metrics1 = describe_shape(primary_aligned_shape)
-
             # STEP 2: Compute OBB geometry
             obb_geom = compute_obb_geometry(primary_aligned_shape)
-
+            
             # STEP 3: Section area
+            # section_area = compute_section_area(primary_aligned_shape)
             section_area = compute_section_area(primary_aligned_shape)
 
             # print(f"Section area: {section_area:.2f}")
@@ -155,31 +154,27 @@ def dstv_pipeline(root_model, project_number, matl_grade):
             # STEP 5: Match profile
             profile_match = classify_profile(cs_data, json_path, tol_dim=1.0, tol_area=.05)
             
-            # print(f"Profile Match complete : {profile_match}")
-
             # STEP 5.5: no match? check for plate
             if profile_match is None:
                 is_plate, final_aligned_solid, ax3, thickness_mm, length_mm, width_mm, step_mass, msg = align_plate_to_xy_plane(primary_aligned_shape)
-                # print(f"Basic X/Y alignment complete, is plate? {is_plate}")
-                # print(f"Is Plate: {is_plate}, aligned_solid: {final_aligned_solid}, Mass: {step_mass}, Message: {msg}")
+                                
                 obb_x = f'{obb_geom["aligned_extents"][0]:.2f}'
                 obb_y = f'{obb_geom["aligned_extents"][1]:.2f}'
                 obb_z = f'{obb_geom["aligned_extents"][2]:.2f}'
                 step_mass = f'{step_mass:.0f}'
+
                 if is_plate:
                     # Branch to take care of plate
                     object_type = "Plate"
                     # print("Creating profile DXF.")
                     hash, dxf_file, dxf_thumb_file = export_profile_dxf_with_pca(final_aligned_solid, f"{dxf_path}\{member_id}.dxf", f"{dxf_thumb}\{member_id}" )
                 else:
-                    # print(f"Solid: {final_aligned_solid}, Thumbnail Path {thumb_path}, Member ID: {member_id}, Mseeage: {msg}")
                     print("ℹ️  Object not identified", msg)
                     object_type = "Other"
                     hash =""
 
                 step_file = export_solid_to_step(final_aligned_solid, step_path, member_id)
                 brep_fingerprint, brep_file = export_solid_to_brep(final_aligned_solid, brep_path, member_id)
-                thumbnail_file = shape_to_thumbnail(final_aligned_solid, thumb_path, member_id)
 
             else:
                 print("✅ Section match found")
@@ -191,9 +186,6 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                 )
 
                 print(f"🔄 Post-swap extents: {obb_geom['aligned_extents']}")
-
-                # print("=== after Width/Height Swap ===")
-                # metrics2 = describe_shape(primary_aligned_shape)
 
                 step_vals = profile_match["STEP"]
                 
@@ -212,10 +204,6 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                     obb_geom["aligned_dir_y"],
                     obb_geom["aligned_dir_z"],
                 )
-
-                # print("=== after align OBB to DSTV ===")
-                # metrics3 = describe_shape(primary_aligned_shape)
-
                 dstv_frame = gp_Ax3(
                     gp_Pnt(0, 0, 0),
                     gp_Dir(obb_geom["aligned_dir_z"].XYZ()),  # thickness
@@ -231,9 +219,6 @@ def dstv_pipeline(root_model, project_number, matl_grade):
 
                 print(f"✅ Orientation refinement complete. New extents: {obb_geom['aligned_extents']}")
 
-                # print("=== after final refinement ===")
-                # metrics2 = describe_shape(primary_aligned_shape)
-
                 # cad output
                 # export_solid_to_brep(shape_orig, brep_path, member_id)
                 object_type = f"{profile_match['Category']} {profile_match['Designation']}"
@@ -241,13 +226,13 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                 step_file = export_solid_to_step(refined_shape, step_path, member_id)
                 brep_fingerprint, brep_file = export_solid_to_brep(refined_shape, brep_path, member_id)
 
-                # # after refine_profile_orientation and compute_obb_geometry
-                # print(">>> OBB extents (L, H, W):", obb_geom["aligned_extents"])
-                # for axis_name in ["x", "y", "z"]:
-                #     vec = obb_geom[f"aligned_dir_{axis_name}"]
-                #     xyz = vec.XYZ()
-                #     print(f">>> aligned_dir_{axis_name}: "
-                #         f"({xyz.X():.6f}, {xyz.Y():.6f}, {xyz.Z():.6f})")
+                # after refine_profile_orientation and compute_obb_geometry
+                print(">>> OBB extents (L, H, W):", obb_geom["aligned_extents"])
+                for axis_name in ["x", "y", "z"]:
+                    vec = obb_geom[f"aligned_dir_{axis_name}"]
+                    xyz = vec.XYZ()
+                    print(f">>> aligned_dir_{axis_name}: "
+                        f"({xyz.X():.6f}, {xyz.Y():.6f}, {xyz.Z():.6f})")
 
                 ## define the DSTV frame and axis direction from geometry
                 dstv_frame = gp_Ax3(
@@ -272,13 +257,13 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                 obb_y = f'{step_vals["height"]:.2f}'
                 obb_z = f'{step_vals["width"]:.2f}'
                 step_mass = f'{step_vals["mass"]:.0f}'
-                # print(raw_df_holes)
+                print(raw_df_holes)
 
                 check_duplicate_holes(raw_df_holes, tolerance=0.5)
 
                 # STEP 9.5: Collate DSTV header
                 dstv_header_data = assemble_dstv_header_data(project_number, 
-                                                            nc_path, 
+                                                            root_model, 
                                                             matl_grade, 
                                                             member_id, 
                                                             profile_match)
@@ -288,8 +273,7 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                 nc1_file, hash = generate_nc1_file(raw_df_holes, dstv_header_data, nc_path, web_cuts)
                 # Drawing
                 html_file = generate_hole_projection_html(raw_df_holes, dstv_header_data, media_path, drilling_path, web_cuts)
-                # Thumbnail
-                thumbnail_file = shape_to_thumbnail(primary_aligned_shape, thumb_path, member_id)
+
 
         except Exception as e:
             print(f"❌ Error in {member_id}: {e}")
@@ -376,16 +360,12 @@ if __name__ == "__main__":
     step20 = "02086 - Steelwork.stp"
     step21 = "MEM-0001.step"    #02086 - Imported Channel Ident issue"
     step22 = "MEM-1181.step"
-    step23 = "MEM-1180.step"
-    step24 = "MEM-1207.step"
-    step25 = "MEM-0602.step"
 
-    step_file = step1
+    step_file = step22
     step_path = str(Path(home_path).joinpath(step_file))
 
-    project = "10206"
-    # project = "test"
-    # project = "02086"
+    # project = "10206"
+    project = "test"
     grade = "S275"
 
     dstv_pipeline(step_path, project, grade)
