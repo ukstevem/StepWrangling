@@ -15,3 +15,28 @@ previews/
 training_data/
 data/projects
 extraction/
+notebooks/debug.log
+notebooks/err.log
+notebooks/parse_errors.log
+notebooks/assembly_tree.json
+notebooks/step-gpt.ipynb
+notebooks/step-gptv2.ipynb
+Python/data/AP6467A-0-709 - Batch 5 steelwork.ifc
+Python/data/Kirby/2mm shim 1Off.dxf
+Python/data/Kirby/2mm Shim.stp
+Python/data/Kirby/3mm shim 1Off.dxf
+Python/data/Kirby/3mm Shim.stp
+Python/data/Kirby/10mm shim 1Off.dxf
+Python/data/Kirby/10mm Shim.stp
+Python/data/Kirby/15mm shim 1Off.dxf
+Python/data/Kirby/15mm Shim.stp
+Python/data/Kirby/275 kV 5.37m High Level Post Insulator x6.stp
+Python/data/Kirby/275 kV PQ Capacitor Voltage Transformer x3.stp
+Python/data/Kirby/275 kV Surge Arrestor Strc Transformer SGT2 x3.stp
+Python/data/Kirby/275 kW Current Transformer Structure x3.stp
+Python/data/Kirby/275 kW Rotary Disconnector Struc.stp
+Python/data/Kirby/275kW 2.7m Post Insulator Structure.stp
+Python/data/Kirby/400 kV Earthing Switch Struc.stp
+Python/data/Kirby/400 kV Surge Arrestor Struc Transformer SGT2 x3.stp
+Python/data/Kirby/400kV Currrent Transformer Structure x3.stp
+Python/data/Kirby/400kV PQ Capacitor Voltage Transformer struc x3.stp

@@ -22,6 +22,19 @@ def record_solid(
     dxf_thumb_path : str,
     section_shape : str,
     assembly_hash : str,
+    signature_hash = str,
+    volume =  float,
+    surface_area =  float,
+    bbox_x =  float,
+    bbox_y =  float,
+    bbox_z =  float,
+    inertia_e1 =  float,
+    inertia_e2 =  float,
+    inertia_e3 =  float,
+    centroid_x =  float,
+    centroid_y =  float,
+    centroid_z =  float,
+    chirality =  int
     ):
     row = {
         "Item ID": name,
@@ -40,7 +53,20 @@ def record_solid(
         "Z (mm)": obb_z,
         "Issues": issues,
         "Hash": hash,
-        "Assembly Hash" : assembly_hash
+        "Assembly Hash" : assembly_hash,
+        "signature_hash" :  signature_hash,
+        "volume":           volume,
+        "surface_area":     surface_area,
+        "bbox_x":           bbox_x,
+        "bbox_y":           bbox_y,
+        "bbox_z":           bbox_z,
+        "inertia_e1":       inertia_e1,
+        "inertia_e2":       inertia_e2,
+        "inertia_e3":       inertia_e3,
+        "centroid_x":       centroid_x,
+        "centroid_y":       centroid_y,
+        "centroid_z":       centroid_z,
+        "chirality":        chirality
     }
     return report_rows.append(row)
 

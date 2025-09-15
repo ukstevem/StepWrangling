@@ -93,7 +93,20 @@ def normalize_report_df(df: pd.DataFrame, project_id,
         "Issues":           "issues",
         "Hash":             "hash",
         "Section Shape":    "section_shape",
-        "Assembly Hash":    "source_model_hash",
+        "Assembly Hash":    "source_model_hash",                     
+        "signature_hash" :  "signature_hash",
+        "volume":           "volume",
+        "surface_area":     "surface_area",
+        "bbox_x":           "bbox_x",
+        "bbox_y":           "bbox_y",
+        "bbox_z":           "bbox_z",
+        "inertia_e1":       "inertia_e1",
+        "inertia_e2":       "inertia_e2",
+        "inertia_e3":       "inertia_e3",
+        "centroid_x":       "centroid_x",
+        "centroid_y":       "centroid_y",
+        "centroid_z":       "centroid_z",
+        "chirality":        "chirality"
     }
     
     # 1) Rename

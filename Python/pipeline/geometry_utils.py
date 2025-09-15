@@ -13,6 +13,7 @@ from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Section
 from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.IFSelect import IFSelect_RetDone
 from OCC.Core.TopoDS import TopoDS_Shape
+from OCC.Core.ShapeAnalysis import ShapeAnalysis_FreeBounds
 
 from pathlib import Path
 import numpy as np
@@ -204,12 +205,73 @@ from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib
 
 
+# def compute_section_area(solid, axis_dir=gp_Dir(1, 0, 0), sample_pos=None, tol=1e-6):
+#     """
+#     Computes a cross-sectional area by slicing the solid and building a face.
+#     Falls back to volume/length if edge loops aren’t closed.
+#     """
+#     # 1. Bounding box to find slice location
+#     bbox = Bnd_Box()
+#     brepbndlib.Add(solid, bbox)
+#     xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+#     length = xmax - xmin
+#     if length <= tol:
+#         return 0.0
+
+#     # 2. Define slicing plane (default slice at midpoint)
+#     x0 = xmin + (length / 2.0 if sample_pos is None else sample_pos)
+#     plane = gp_Pln(gp_Ax3(gp_Pnt(x0, 0, 0), axis_dir))
+
+#     # 3. Perform section
+#     section = BRepAlgoAPI_Section(solid, plane)
+#     section.ComputePCurveOn1(True)
+#     section.Approximation(True)
+#     section.Build()
+#     if not section.IsDone():
+#         raise RuntimeError("Section operation failed")
+#     edges_shape = section.Shape()
+
+#     # 4. Extract edges
+#     exp = TopExp_Explorer(edges_shape, TopAbs_EDGE)
+#     edges = []
+#     while exp.More():
+#         edges.append(exp.Current())
+#         exp.Next()
+#     if not edges:
+#         return 0.0
+
+#     # 5. Attempt robust wire and face construction
+#     try:
+#         wire_builder = BRepBuilderAPI_MakeWire()
+#         for e in edges:
+#             wire_builder.Add(e)
+#         if hasattr(wire_builder, 'Close'):
+#             wire_builder.Close()
+#         if not wire_builder.IsDone():
+#             raise RuntimeError("Wire not closed")
+#         wire = wire_builder.Wire()
+
+#         face_maker = BRepBuilderAPI_MakeFace(plane)
+#         face_maker.Add(wire)
+#         props = GProp_GProps()
+#         brepgprop.SurfaceProperties(face_maker.Face(), props)
+#         return abs(props.Mass())
+#     except Exception:
+#         # Fallback: approximate as volume/length
+#         vol_props = GProp_GProps()
+#         brepgprop.VolumeProperties(solid, vol_props)
+#         volume = vol_props.Mass()
+#         return volume / length
+
+
+
 def compute_section_area(solid, axis_dir=gp_Dir(1, 0, 0), sample_pos=None, tol=1e-6):
     """
-    Computes a cross-sectional area by slicing the solid and building a face.
-    Falls back to volume/length if edge loops aren’t closed.
+    Computes cross-sectional area of a solid by slicing it with a plane
+    and measuring the area of the largest closed wire.
+    Falls back to volume/length if wire construction fails.
     """
-    # 1. Bounding box to find slice location
+    # 1. Bounding box
     bbox = Bnd_Box()
     brepbndlib.Add(solid, bbox)
     xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
@@ -217,50 +279,58 @@ def compute_section_area(solid, axis_dir=gp_Dir(1, 0, 0), sample_pos=None, tol=1
     if length <= tol:
         return 0.0
 
-    # 2. Define slicing plane (default slice at midpoint)
+    # 2. Section plane
     x0 = xmin + (length / 2.0 if sample_pos is None else sample_pos)
     plane = gp_Pln(gp_Ax3(gp_Pnt(x0, 0, 0), axis_dir))
 
-    # 3. Perform section
+    # 3. Section operation
     section = BRepAlgoAPI_Section(solid, plane)
     section.ComputePCurveOn1(True)
     section.Approximation(True)
     section.Build()
     if not section.IsDone():
         raise RuntimeError("Section operation failed")
+
     edges_shape = section.Shape()
 
-    # 4. Extract edges
-    exp = TopExp_Explorer(edges_shape, TopAbs_EDGE)
-    edges = []
-    while exp.More():
-        edges.append(exp.Current())
-        exp.Next()
-    if not edges:
-        return 0.0
+    # 4. Extract closed wires safely
+    fb = ShapeAnalysis_FreeBounds(edges_shape, tol, False, False)
+    closed_wires_seq = fb.GetClosedWires()
 
-    # 5. Attempt robust wire and face construction
-    try:
-        wire_builder = BRepBuilderAPI_MakeWire()
-        for e in edges:
-            wire_builder.Add(e)
-        if hasattr(wire_builder, 'Close'):
-            wire_builder.Close()
-        if not wire_builder.IsDone():
-            raise RuntimeError("Wire not closed")
-        wire = wire_builder.Wire()
-
-        face_maker = BRepBuilderAPI_MakeFace(plane)
-        face_maker.Add(wire)
+    if (
+        closed_wires_seq is None
+        or not hasattr(closed_wires_seq, "Length")
+        or closed_wires_seq.Length() == 0
+    ):
+        # fallback: use volume / length
         props = GProp_GProps()
-        brepgprop.SurfaceProperties(face_maker.Face(), props)
-        return abs(props.Mass())
-    except Exception:
-        # Fallback: approximate as volume/length
-        vol_props = GProp_GProps()
-        brepgprop.VolumeProperties(solid, vol_props)
-        volume = vol_props.Mass()
+        brepgprop.VolumeProperties(solid, props)
+        volume = props.Mass()
         return volume / length
+
+    # 5. Compute area from the largest closed wire
+    max_area = 0.0
+    try:
+        for i in range(1, closed_wires_seq.Length() + 1):
+            shape = closed_wires_seq.Value(i)
+            if shape.ShapeType() != TopAbs_EDGE and hasattr(topods, "Wire"):
+                wire = topods.Wire(shape)
+                face = BRepBuilderAPI_MakeFace(plane, wire).Face()
+                props = GProp_GProps()
+                brepgprop.SurfaceProperties(face, props)
+                area = abs(props.Mass())
+                if area > max_area:
+                    max_area = area
+    except Exception as e:
+        print("⚠️ Error computing area from wires:", e)
+        # fallback
+        props = GProp_GProps()
+        brepgprop.VolumeProperties(solid, props)
+        volume = props.Mass()
+        return volume / length
+
+    return max_area if max_area > 0 else (volume / length)
+
 
 
 def compute_average_section_area(solid, axis_dir=gp_Dir(1, 0, 0), n_samples=5, tol=1e-6):

@@ -27,7 +27,6 @@ import os
 import pyvista as pv
 import ezdxf
 
-
 from pathlib import Path
 from OCC.Core.STEPControl import STEPControl_Writer, STEPControl_AsIs
 from OCC.Core.IFSelect    import IFSelect_RetDone
@@ -111,8 +110,6 @@ def shape_to_thumbnail(solid, path, filename, deflection=0.5):
     print(f"🖼️ Thumbnail saved to {filename}")
     
     return(Path(rf"{path}/{filename}.png"))
-
-
 
 import ezdxf
 from OCC.Core.TopExp import TopExp_Explorer
@@ -409,134 +406,6 @@ def compute_dxf_fingerprint(dxf_path: Union[Path, str], tol: float = 0.01) -> st
 
     # Hash WKB
     return hashlib.md5(ring.wkb).hexdigest()
-
-
-# def export_profile_dxf_with_pca(shape,
-#                                 dxf_path: Union[Path, str],
-#                                 thumb_path: Optional[Union[Path, str]] = None,
-#                                 samples_per_curve: int = 16,
-#                                 fingerprint_tol: float = 0.01
-#                                 ) -> Tuple[str, Path, Path]:
-#     """
-#     Export a PCA-aligned DXF profile, generate a thumbnail, and fingerprint it.
-
-#     Args:
-#       shape: OCC TopoDS_Shape to export
-#       dxf_path: output DXF file path
-#       thumb_path: optional base path for thumbnail (PNG). Defaults to same name as DXF.
-#       samples_per_curve: number of points per curved edge
-#       fingerprint_tol: rounding tolerance for fingerprint
-
-#     Returns:
-#       fingerprint (str): MD5 hash of quantized profile
-#       dxf_path (Path): Path to saved DXF
-#       thumbnail_path (Path): Path to saved PNG thumbnail
-#     """
-#     dxf_path = Path(dxf_path)
-#     samples_per_curve = int(samples_per_curve)
-
-#     # 1) Largest planar face
-#     best_face, best_area = None, 0.0
-#     exp = TopExp_Explorer(shape, TopAbs_FACE)
-#     while exp.More():
-#         f = exp.Current(); surf = BRepAdaptor_Surface(f)
-#         if surf.GetType() != 0:
-#             exp.Next(); continue
-#         props = GProp_GProps(); brepgprop.SurfaceProperties(f, props)
-#         area = props.Mass()
-#         if area > best_area:
-#             best_area, best_face = area, f
-#         exp.Next()
-#     if best_face is None:
-#         raise RuntimeError("No planar face found on shape")
-
-#     # 2) Boundary wires
-#     analyser = ShapeAnalysis_FreeBounds(best_face)
-#     bc = analyser.GetClosedWires(); wires = []
-#     we = TopExp_Explorer(bc, TopAbs_WIRE)
-#     while we.More(): wires.append(we.Current()); we.Next()
-#     if not wires:
-#         raise RuntimeError("No boundary wires found")
-
-#     # 3) Sample & project
-#     plane = BRepAdaptor_Surface(best_face).Plane()
-#     all_pts, segments = [], []
-#     for wire in wires:
-#         ee = TopExp_Explorer(wire, TopAbs_EDGE)
-#         while ee.More():
-#             edge = ee.Current(); adaptor = BRepAdaptor_Curve(edge)
-#             t0, t1 = adaptor.FirstParameter(), adaptor.LastParameter()
-#             if adaptor.GetType() == GeomAbs_Line:
-#                 params = [t0, t1]
-#             else:
-#                 params = np.linspace(float(t0), float(t1), samples_per_curve)
-#             uv = []
-#             for t in params:
-#                 org = plane.Location()
-#                 dx = gp_Vec(org, adaptor.Value(t)).Dot(gp_Vec(plane.XAxis().Direction()))
-#                 dy = gp_Vec(org, adaptor.Value(t)).Dot(gp_Vec(plane.YAxis().Direction()))
-#                 uv.append((dx, dy))
-#             all_pts.extend(uv)
-#             segments.extend(zip(uv[:-1], uv[1:]))
-#             ee.Next()
-#     if not segments:
-#         raise RuntimeError("No segments generated from shape")
-
-#     # 4) PCA rotation (right-handed)
-#     pts = np.vstack(all_pts); center = pts.mean(axis=0)
-#     cov = np.cov((pts-center).T)
-#     vals, vecs = np.linalg.eigh(cov)
-#     idx = np.argsort(vals)[::-1]
-#     R = vecs[:,idx].T
-#     if np.linalg.det(R) < 0:
-#         R[1,:] *= -1
-
-#     # 5) Rotate segments
-#     rotated = []
-#     for (x1,y1),(x2,y2) in segments:
-#         p1 = R.dot(np.array([x1,y1]) - center)
-#         p2 = R.dot(np.array([x2,y2]) - center)
-#         rotated.append((tuple(p1), tuple(p2)))
-
-#     # 6) Write DXF
-#     doc = ezdxf.new(dxfversion="R2010"); msp = doc.modelspace()
-#     for (u1,v1),(u2,v2) in rotated:
-#         msp.add_line((u1,v1),(u2,v2))
-#     doc.saveas(str(dxf_path))
-#     # print(f"Wrote PCA-aligned DXF → {dxf_path}")
-
-#     # 7) Thumbnail
-#     thumb_base = Path(thumb_path) if thumb_path else dxf_path.with_suffix('')
-#     thumbnail_path = thumb_base.with_suffix('.png')
-#     def _manual(path):
-#         try:
-#             import matplotlib.pyplot as plt
-#         except ImportError:
-#             print("matplotlib not installed; cannot generate thumbnail")
-#             return
-#         fig, ax = plt.subplots(); fig.patch.set_facecolor('white'); ax.set_facecolor('white')
-#         for (x1,y1),(x2,y2) in rotated:
-#             ax.plot([x1,x2],[y1,y2],'k-',linewidth=0.8)
-#         ax.set_aspect('equal'); ax.axis('off')
-#         fig.savefig(path, dpi=150, bbox_inches='tight', pad_inches=0, transparent=False)
-#         plt.close(fig)
-#     if qsave:
-#         try:
-#             qsave(msp, str(thumbnail_path), bg='#FFFFFF', fg='#000000')
-#             print(f"Saved thumbnail via qsave → {thumbnail_path}")
-#         except Exception as e:
-#             print(f"qsave failed: {e}, falling back to manual thumbnail")
-#             _manual(thumbnail_path)
-#     else:
-#         print("ezdxf matplotlib extension not installed; using manual thumbnail")
-#         _manual(thumbnail_path)
-
-#     # 8) Fingerprint
-#     fp = compute_dxf_fingerprint(dxf_path, tol=fingerprint_tol)
-#     print(f"✅ DXF saved to {dxf_path}")
-#     return fp, dxf_path, thumbnail_path
-
-
 
 
 def _compute_edge_axes(segments, perp_tol=1e-3, share_tol=1e-6):

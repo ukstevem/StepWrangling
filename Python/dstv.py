@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from pipeline.step_loader import load_step_file
+from pipeline.signature_utils import compute_signature_info
 from pipeline.geometry_utils import (robust_align_solid_from_geometry, 
                                      ensure_right_handed, 
                                      compute_obb_geometry, 
@@ -49,7 +50,7 @@ from pathlib import Path
 
 
 
-def dstv_pipeline(root_model, project_number, matl_grade):
+def dstv_pipeline(step_file, root_model, project_number, matl_grade):
 
     # Log start time
     start_time = datetime.now()
@@ -64,19 +65,20 @@ def dstv_pipeline(root_model, project_number, matl_grade):
     fallback_root = BASE / "C:/dev/step-gemini/Extraction"
 
     # Project Driven
-    base_path, nc_path, report_path, drilling_path, cad_path, thumb_path, step_path, brep_path, dxf_path, dxf_thumb = create_project_directories(project_number, network_root, fallback_root)
+    base_path, nc_path, report_path, drilling_path, cad_path, thumb_path, step_path, brep_path, dxf_path, dxf_thumb = create_project_directories(step_file, network_root, fallback_root)
 
     if not os.path.isfile(root_model):
-        raise FileNotFoundError(f"Couldn’t find STEP file at: {root_model!r}")
+        raise FileNotFoundError(f"Could not find a STEP file at: {root_model!r}")
     solids = load_step_file(root_model)
 
     # setup for fingerprint and saving out of the root model
+    
     # setting paths
     root_name = Path(root_model).name            # e.g. "part123.step"
     cad_file  = Path(cad_path) / root_name       # e.g. ".../Extraction/Proj1/Models/part123.step"
     # compute an MD5 of the newly written STEP
     hash_type = 'md5'
-    source_model_hash = fingerprint_solids(solids, str(cad_file), hash_type)
+    source_model_hash = fingerprint_solids(solids, str(cad_file), hash_type) # To be able to confirm model used at later date.
 
     #write data to source_model table
     # now insert a row into `source_model`
@@ -120,6 +122,19 @@ def dstv_pipeline(root_model, project_number, matl_grade):
         dxf_thumb_file = ""
         section_shape = ""
         assembly_hash = ""
+        signature_hash = ""
+        volume = ""
+        surface_area = ""
+        bbox_x = ""
+        bbox_y = ""
+        bbox_z = ""
+        inertia_e1 = ""
+        inertia_e2 = ""
+        inertia_e3 = ""
+        centroid_x = ""
+        centroid_y = ""
+        centroid_z = ""
+        chirality = ""
         print(f"\n🟦 Processing {member_id}... {datetime.now().strftime('%H:%M:%S')}")
 
         try:
@@ -131,6 +146,14 @@ def dstv_pipeline(root_model, project_number, matl_grade):
             primary_aligned_shape, trsf, cs, largest_face, dir_x, dir_y, dir_z = robust_align_solid_from_geometry(shape_orig)
             dir_x, dir_y, dir_z = ensure_right_handed(dir_x, dir_y, dir_z)
 
+            # Get signature details of initial shape
+            inv, signature_hash = compute_signature_info(
+                primary_aligned_shape,
+                dir_x, dir_y, dir_z,
+                precision=3,
+                hash_type="md5"
+            )
+
             # print("=== Primary Aligned Shape ===")
             # metrics1 = describe_shape(primary_aligned_shape)
 
@@ -140,7 +163,7 @@ def dstv_pipeline(root_model, project_number, matl_grade):
             # STEP 3: Section area
             section_area = compute_section_area(primary_aligned_shape)
 
-            # print(f"Section area: {section_area:.2f}")
+            print(f"Section area: {section_area:.2f}")
 
             # STEP 4: Classification signature
             cs_data = {
@@ -150,12 +173,12 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                 "length": obb_geom["aligned_extents"][0]
             }
 
-            # print(cs_data)
+            print(cs_data)
 
             # STEP 5: Match profile
             profile_match = classify_profile(cs_data, json_path, tol_dim=1.0, tol_area=.05)
             
-            # print(f"Profile Match complete : {profile_match}")
+            print(f"Profile Match complete : {profile_match}")
 
             # STEP 5.5: no match? check for plate
             if profile_match is None:
@@ -310,9 +333,21 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                      hash = hash,
                      dxf_thumb_path = dxf_thumb_file,
                      section_shape = section_shape,
-                     assembly_hash = source_model_hash
-                        )
-
+                     assembly_hash = source_model_hash,
+                     signature_hash = signature_hash,
+                     volume = inv["volume"],
+                     surface_area = inv["surface_area"],
+                     bbox_x = inv["bbox_x"],
+                     bbox_y = inv["bbox_y"],
+                     bbox_z = inv["bbox_z"],
+                     inertia_e1 = inv["inertia_ix"],
+                     inertia_e2 = inv["inertia_iy"],
+                     inertia_e3 = inv["inertia_iz"],
+                     centroid_x = inv["centroid_x"],
+                     centroid_y = inv["centroid_y"],
+                     centroid_z = inv["centroid_z"],
+                     chirality = inv["chirality"]
+             )
 
         # # Export summary
         record_solid(report_rows, 
@@ -332,10 +367,25 @@ def dstv_pipeline(root_model, project_number, matl_grade):
                      hash = hash,
                      dxf_thumb_path = dxf_thumb_file,
                      section_shape = section_shape,
-                     assembly_hash = source_model_hash
+                     assembly_hash = source_model_hash,
+                     signature_hash = signature_hash,
+                     volume = inv["volume"],
+                     surface_area = inv["surface_area"],
+                     bbox_x = inv["bbox_x"],
+                     bbox_y = inv["bbox_y"],
+                     bbox_z = inv["bbox_z"],
+                     inertia_e1 = inv["inertia_ix"],
+                     inertia_e2 = inv["inertia_iy"],
+                     inertia_e3 = inv["inertia_iz"],
+                     centroid_x = inv["centroid_x"],
+                     centroid_y = inv["centroid_y"],
+                     centroid_z = inv["centroid_z"],
+                     chirality = inv["chirality"]
                     )
 
     report_df = pd.DataFrame(report_rows)
+
+    # print(report_df)
 
     # Create HTML report
     df_to_html_with_images(report_df, report_path, project_number)
@@ -379,13 +429,59 @@ if __name__ == "__main__":
     step23 = "MEM-1180.step"
     step24 = "MEM-1207.step"
     step25 = "MEM-0602.step"
+    step26 = "4v1800 Panel Off.step"
 
-    step_file = step1
+    # For Angle NC1 file 
+    step507 = "MEM-0507.step"
+    step515 = "MEM-0515.step"
+    step523 = "MEM-0523.step"
+    step530 = "MEM-0530.step"
+    step538 = "MEM-0538.step"    
+    step602 = "MEM-0602.step"
+    step610 = "MEM-0610.step"
+    step164 = "MEM-1164.step"
+    step166 = "MEM-1166.step"     
+
+    # For cranked Beams NC1
+    step219 = "MEM-0219.step"
+    step234 = "MEM-0234.step"
+    step254 = "MEM-0254.step"
+    step276 = "MEM-0276.step"
+    step300 = "MEM-0300.step"    
+    step161 = "MEM-0161.step"
+    step185 = "MEM-0185.step"
+    step198 = "MEM-0198.step"
+    step163 = "MEM-0163.step"    
+    step221 = "MEM-0221.step"
+    step1074 = "MEM-1074.step"
+    step1051 = "MEM-1051.step"
+
+    # cranked beam assembly 1028 rev B
+    step1028 = "C25001-1-1028.step"
+
+    # Kirby
+    step23601 = r"kirby\275 kV 5.37m High Level Post Insulator x6.stp"
+    step23602 = r"kirby\275 kV PQ Capacitor Voltage Transformer x3.stp"
+    step23603 = r"kirby\275 kV Surge Arrestor Strc Transformer SGT2 x3.stp"
+    step23604 = r"kirby\275 kW Current Transformer Structure x3.stp"
+    step23605 = r"kirby\275 kW Rotary Disconnector Struc.stp"
+    step23606 = r"kirby\275kW 2.7m Post Insulator Structure.stp"
+
+    # BWB
+    step669 = "P669K-6v3000-p2b2-EF2end.step"
+
+    # 02138 - ERG Structures
+    step02138 = "AP6467A-0-709 - Batch 5 steelwork.step"
+
+    # 02140 - ERG Castle Environmental
+    step02140 = "AP5630-0-872 STEEL LADDER STP.step"
+
+    step_file = step02140
     step_path = str(Path(home_path).joinpath(step_file))
 
-    project = "10206"
+    project = "02140"
     # project = "test"
     # project = "02086"
-    grade = "S275"
+    grade = "Mixed"
 
-    dstv_pipeline(step_path, project, grade)
+    dstv_pipeline(step_file, step_path, project, grade)
