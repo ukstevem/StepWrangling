@@ -357,10 +357,6 @@ def compute_average_section_area(solid, axis_dir=gp_Dir(1, 0, 0), n_samples=5, t
     return avg
 
 
-
-
-
-
 def swap_width_and_height_if_required(profile_match, shape, obb_geom):
     """
     Rotates shape 90° around X axis if profile classification flagged a mismatch

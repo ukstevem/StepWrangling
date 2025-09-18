@@ -6,7 +6,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from pipeline.step_loader import load_step_file
-from pipeline.signature_utils import compute_signature_info
+from pipeline.signature_utils import (compute_signature_info,
+                                        build_tolerant_signature,
+                                        bucket_by_signature,
+                                        coarse_key_from_half_sorted,
+                                        bucket_by_coarse_extents) 
 from pipeline.geometry_utils import (robust_align_solid_from_geometry, 
                                      ensure_right_handed, 
                                      compute_obb_geometry, 
@@ -47,6 +51,9 @@ from pipeline.database import (dump_df_to_supabase, normalize_report_df,
                                 )
 from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3
 from pathlib import Path
+from pipeline.dupe_report import generate_duplicate_reports
+from pipeline.geom_alignment import robust_align_length_to_X
+from collections import defaultdict
 
 
 
@@ -102,6 +109,8 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
 
     # Now get going on extraction
     report_rows = []    #report array complied per part in loop
+    tolerant_sig_rows = []   # for duplicate candidate bucketing
+    coarse_rows = []  # add before the for-loop
 
     for i, shape_orig in enumerate(solids):
         # set variable defaults
@@ -137,13 +146,25 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
         chirality = ""
         print(f"\n🟦 Processing {member_id}... {datetime.now().strftime('%H:%M:%S')}")
 
+        # safe defaults so the except-block can always reference inv
+        inv = {
+            "volume": 0.0, "surface_area": 0.0,
+            "bbox_x": 0.0, "bbox_y": 0.0, "bbox_z": 0.0,
+            "inertia_ix": 0.0, "inertia_iy": 0.0, "inertia_iz": 0.0,
+            "centroid_x": 0.0, "centroid_y": 0.0, "centroid_z": 0.0,
+            "chirality": 1,
+        }
+
         try:
 
             # print("=== Original Shape ===")
             # metrics0 = describe_shape(shape_orig)
 
             # STEP 1: Align to major geometry
-            primary_aligned_shape, trsf, cs, largest_face, dir_x, dir_y, dir_z = robust_align_solid_from_geometry(shape_orig)
+            primary_aligned_shape, trsf, cs, largest_face, dir_x, dir_y, dir_z, dbg = \
+                robust_align_length_to_X(shape_orig, debug=True)
+
+            # primary_aligned_shape, trsf, cs, largest_face, dir_x, dir_y, dir_z = robust_align_solid_from_geometry(shape_orig)
             dir_x, dir_y, dir_z = ensure_right_handed(dir_x, dir_y, dir_z)
 
             # Get signature details of initial shape
@@ -159,6 +180,28 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
 
             # STEP 2: Compute OBB geometry
             obb_geom = compute_obb_geometry(primary_aligned_shape)
+
+            # --- tolerant, transform-invariant fingerprint (for duplicate detection) ---
+            # Use OBB half-extents if available (preferred). OBB extents in your code are full lengths.
+            hx = obb_geom["aligned_extents"][0] / 2.0
+            hy = obb_geom["aligned_extents"][1] / 2.0
+            hz = obb_geom["aligned_extents"][2] / 2.0
+            half_sorted = tuple(sorted((hx, hy, hz), reverse=True))
+
+            tol_sig = build_tolerant_signature(
+                primary_aligned_shape,
+                half_extents_sorted=half_sorted,
+                vol_bin=None, 
+                area_bin=None, 
+                ext_bin=1.0,
+                mom_bin=None,         # drop moments
+                use_faces=False,      # drop face counts
+                include_chirality=False
+            )
+
+            # keep for later bucketing
+            coarse_rows.append({"id": member_id, "exr_q": coarse_key_from_half_sorted(half_sorted, step=1.0)})
+            tolerant_sig_rows.append({"id": member_id, "sig_hash": tol_sig.sig_hash,"half_extents_sorted": half_sorted,})
 
             # STEP 3: Section area
             section_area = compute_section_area(primary_aligned_shape)
@@ -180,30 +223,63 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
             
             print(f"Profile Match complete : {profile_match}")
 
+            shape_for_export = None     # <- use this everywhere below
+            thumb_frame      = None     # <- gp_Ax3 for thumbnails (ax3 for plates, dstv_frame for sections)
+
             # STEP 5.5: no match? check for plate
             if profile_match is None:
-                is_plate, final_aligned_solid, ax3, thickness_mm, length_mm, width_mm, step_mass, msg = align_plate_to_xy_plane(primary_aligned_shape)
+                is_plate, final_aligned_solid, ax3, thickness_mm, length_mm, width_mm, step_mass, msg, sig = align_plate_to_xy_plane(
+                        primary_aligned_shape,
+                        prefer_dir_x=dir_x,
+                        lock_x=True,             # keeps your primary X locked
+                        square_rel_tol=1e-3,     # tweak if your models are noisy
+                        warn_obb_delta_deg=1.0,  # None to silence the warning
+                        thickness_limit_mm=101.0,
+                    )
                 # print(f"Basic X/Y alignment complete, is plate? {is_plate}")
                 # print(f"Is Plate: {is_plate}, aligned_solid: {final_aligned_solid}, Mass: {step_mass}, Message: {msg}")
                 obb_x = f'{obb_geom["aligned_extents"][0]:.2f}'
                 obb_y = f'{obb_geom["aligned_extents"][1]:.2f}'
                 obb_z = f'{obb_geom["aligned_extents"][2]:.2f}'
                 step_mass = f'{step_mass:.0f}'
+
                 if is_plate:
                     # Branch to take care of plate
                     object_type = "Plate"
                     # print("Creating profile DXF.")
-                    hash, dxf_file, dxf_thumb_file = export_profile_dxf_with_pca(final_aligned_solid, f"{dxf_path}\{member_id}.dxf", f"{dxf_thumb}\{member_id}" )
+                    # hash, dxf_file, dxf_thumb_file = export_profile_dxf_with_pca(final_aligned_solid, f"{dxf_path}\{member_id}.dxf", f"{dxf_thumb}\{member_id}" )
+                    hash, dxf_file, dxf_thumb_file = export_profile_dxf_with_pca(
+                        final_aligned_solid,
+                        f"{dxf_path}/{member_id}.dxf",
+                        thumb_path=f"{dxf_thumb}/{member_id}",
+                        samples_per_curve=32,
+                        fingerprint_tol=0.5,
+                        ax3=ax3,                 # 👈 use the frame returned by align_plate_to_xy_plane
+                        canonicalize=True        # optional: longest side → +X, bottom-left at (0,0)
+                    )
+
+                    # # Thumbnail rendered in the same local frame (orthographic TOP)
+                    # thumbnail_file = shape_to_thumbnail(
+                    #         final_aligned_solid, thumb_path, member_id,
+                    #         ax3=ax3,
+                    #         camera="iso",              # or "top"
+                    #         iso_dir=(-1.0, -1.0, 1.0), # pick iso corner you like; try (1,1,1) too
+                    #     )
                 else:
                     # print(f"Solid: {final_aligned_solid}, Thumbnail Path {thumb_path}, Member ID: {member_id}, Mseeage: {msg}")
                     print("ℹ️  Object not identified", msg)
                     object_type = "Other"
                     hash =""
 
+                shape_for_export = final_aligned_solid
+                thumb_frame      = ax3
+
                 step_file = export_solid_to_step(final_aligned_solid, step_path, member_id)
                 brep_fingerprint, brep_file = export_solid_to_brep(final_aligned_solid, brep_path, member_id)
-                thumbnail_file = shape_to_thumbnail(final_aligned_solid, thumb_path, member_id)
-
+                thumbnail_file = shape_to_thumbnail(
+                        shape_for_export, thumb_path, member_id,
+                        ax3=thumb_frame, camera="iso"   # "top" if you prefer top-down
+                    )
             else:
                 print("✅ Section match found")
                 # print(f"Profile Match Data: {profile_match}, {profile_match['JSON']}\n {profile_match['STEP']}")
@@ -312,7 +388,15 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                 # Drawing
                 html_file = generate_hole_projection_html(raw_df_holes, dstv_header_data, media_path, drilling_path, web_cuts)
                 # Thumbnail
-                thumbnail_file = shape_to_thumbnail(primary_aligned_shape, thumb_path, member_id)
+                # thumbnail_file = shape_to_thumbnail(primary_aligned_shape, thumb_path, member_id)
+                thumbnail_file = shape_to_thumbnail(
+                    refined_shape,
+                    thumb_path,
+                    member_id,
+                    ax3=dstv_frame,    # 👈 lock to your DSTV frame (X=length, Y=height)
+                    deflection=0.5,
+                    px=900
+                )
 
         except Exception as e:
             print(f"❌ Error in {member_id}: {e}")
@@ -384,11 +468,39 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                     )
 
     report_df = pd.DataFrame(report_rows)
-
     # print(report_df)
 
     # Create HTML report
     df_to_html_with_images(report_df, report_path, project_number)
+
+    # Create Duplication Report
+    # Build duplicate buckets from tolerant_sig_rows
+    dupe_index = bucket_by_signature(tolerant_sig_rows)
+
+    # Coarse, dimensions-only groups (very forgiving, great safety net)
+    dupe_index_coarse = bucket_by_coarse_extents(
+        tolerant_sig_rows,
+        step=1.0,  # try 1.0 mm first; bump to 2.0 mm if you still miss repeats
+    )
+
+    # Write condensed duplicate bucket report alongside your main HTML
+    generate_duplicate_reports(
+        report_df=report_df,
+        dupe_index=dupe_index,
+        output_dir=report_path,
+        project_number=project_number,
+        min_size=2  # only groups with 2+ members
+        )
+    
+    # Coarse report (dimension-only)
+    generate_duplicate_reports(
+        report_df=report_df,
+        dupe_index=dupe_index_coarse,
+        output_dir=report_path,
+        project_number=f"{project_number}_coarse",  # file gets the _coarse suffix
+        min_size=2,
+    )
+
 
     # Log to Supabase
     report_for_db = normalize_report_df(report_df, project_number)
@@ -476,10 +588,10 @@ if __name__ == "__main__":
     # 02140 - ERG Castle Environmental
     step02140 = "AP5630-0-872 STEEL LADDER STP.step"
 
-    step_file = step02140
+    step_file = step02138
     step_path = str(Path(home_path).joinpath(step_file))
 
-    project = "02140"
+    project = "02138"
     # project = "test"
     # project = "02086"
     grade = "Mixed"
