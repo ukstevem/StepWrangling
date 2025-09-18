@@ -11,6 +11,8 @@ from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.GeomLProp import GeomLProp_SLProps
 
+from pipeline.geometry_utils import plate_guard_heuristics
+
 THICKNESS_LIMIT_MM = 101.0
 mat_density = 0.000000784
 
@@ -124,6 +126,23 @@ def align_plate_to_xy_plane(
       * thickness_mm is ALWAYS the smallest of the three aligned extents.
       * thickness_limit_mm is optional; if None, no absolute thickness gate is applied.
     """
+
+    def align_plate_to_xy_plane(solid, *args, **kwargs):
+        # --- Plate guardrail ---
+        ok, diag = plate_guard_heuristics(solid, axis_dir=gp_Dir(1,0,0))
+        if not ok:
+            # Keep your return signature; veto plate early
+            return (
+                False,          # is_plate
+                None,           # final_aligned_solid
+                None,           # ax3
+                0.0, 0.0, 0.0,  # thickness_mm, length_mm, width_mm
+                0.0,            # step_mass
+                f"Plate guard veto: {diag}",  # msg
+                None            # sig / extra
+            )
+
+
     try:
         # --- dimensions from OBB (not yaw) on the INPUT solid ---
         center, half_extents, axes = compute_section_and_length_and_origin_from_obb(solid)

@@ -268,7 +268,7 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                 else:
                     # print(f"Solid: {final_aligned_solid}, Thumbnail Path {thumb_path}, Member ID: {member_id}, Mseeage: {msg}")
                     print("ℹ️  Object not identified", msg)
-                    object_type = "Other"
+                    object_type = "Multi-Body" if (msg and "multi_body_shape" in msg) else "Unknown"
                     hash =""
 
                 shape_for_export = final_aligned_solid

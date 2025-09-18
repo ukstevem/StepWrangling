@@ -1,5 +1,5 @@
 from OCC.Core.TopExp import TopExp_Explorer
-from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
+from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_WIRE, TopAbs_SOLID
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.GProp import GProp_GProps
 from OCC.Core.BRep import BRep_Tool
@@ -20,6 +20,209 @@ import numpy as np
 import argparse
 import hashlib
 import os
+
+# Optional diagnostics filled by compute_section_area() in robust mode.
+# Callers can read this (e.g., for logging) but the function still just returns a float.
+from typing import Dict, Any
+CSA_DIAG: Dict[str, Any] = {}
+
+# --- Helper: area of a single wire on a given plane (unsigned) ---
+def _wire_area_on_plane(plane, wire):
+    """Build a temporary planar face from 'wire' on 'plane' and return its unsigned area."""
+    face = BRepBuilderAPI_MakeFace(plane, wire).Face()
+    gp = GProp_GProps()
+    brepgprop.SurfaceProperties(face, gp)
+    return abs(gp.Mass())
+
+# --- Helper : for multi-body parts ---
+def count_solids_in_shape(shape) -> int:
+    """Count standalone TopAbs_SOLID entities in the shape (detects multi-body STEP)."""
+    n = 0
+    exp = TopExp_Explorer(shape, TopAbs_SOLID)
+    while exp.More():
+        n += 1
+        exp.Next()
+    return n
+
+def _section_islands_stats(solid, x0_abs, axis_dir=gp_Dir(1,0,0), tol=1e-6):
+    """
+    One slice diagnostic:
+      - islands: number of disjoint OUTER loops (approx via bbox containment)
+      - H, W: bbox of the union of all loops
+      - area_sum: sum of unsigned areas of all outer loops (gross over islands)
+    """
+    bbox = Bnd_Box(); brepbndlib.Add(solid, bbox)
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+    L = xmax - xmin
+    eps = max(1e-3, 1e-4*L)
+    x0 = max(xmin + eps, min(xmax - eps, x0_abs))
+
+    plane = gp_Pln(gp_Ax3(gp_Pnt(x0, 0, 0), axis_dir))
+    sec = BRepAlgoAPI_Section(solid, plane)
+    sec.ComputePCurveOn1(True)
+    sec.Approximation(True)
+    # sec.SetFuzzyValue(tol)
+    sec.Build()
+    if not sec.IsDone():
+        return {'ok': False}
+
+    # get all closed wires
+    fb = ShapeAnalysis_FreeBounds(sec.Shape(), tol, False, False)
+    seq = fb.GetClosedWires()
+    if seq is None or not hasattr(seq, "Length") or seq.Length() == 0:
+        return {'ok': False}
+
+    # collect wires with their bbox and area
+    wires = []
+    for i in range(1, seq.Length()+1):
+        s = seq.Value(i)
+        if s.ShapeType() == TopAbs_WIRE:
+            w = topods.Wire(s)
+            bb = Bnd_Box(); brepbndlib.Add(w, bb)
+            _, y0, z0, _, y1, z1 = bb.Get()
+            area = _wire_area_on_plane(plane, w)
+            wires.append({'wire': w, 'bb': (y0,z0,y1,z1), 'area': float(area)})
+
+    if not wires:
+        return {'ok': False}
+
+    # island inference by bbox containment (simple, fast):
+    # a wire is an "island" if its bbox is not strictly inside any other wire's bbox.
+    def bb_inside(bb_a, bb_b, margin=1e-3):
+        ay0, az0, ay1, az1 = bb_a
+        by0, bz0, by1, bz1 = bb_b
+        return (ay0 >= by0 - margin and az0 >= bz0 - margin and
+                ay1 <= by1 + margin and az1 <= bz1 + margin)
+
+    outer_flags = []
+    for i, wi in enumerate(wires):
+        inside_any = False
+        for j, wj in enumerate(wires):
+            if i == j: continue
+            if bb_inside(wi['bb'], wj['bb']):
+                inside_any = True
+                break
+        outer_flags.append(not inside_any)
+
+    # union bbox of all loops (good enough for H/W)
+    ymins = [w['bb'][0] for w in wires]
+    zmins = [w['bb'][1] for w in wires]
+    ymaxs = [w['bb'][2] for w in wires]
+    zmaxs = [w['bb'][3] for w in wires]
+    H = float(max(ymaxs) - min(ymins))
+    W = float(max(zmaxs) - min(zmins))
+
+    islands = sum(1 for f in outer_flags if f)
+    area_sum = float(sum(w['area'] for w, f in zip(wires, outer_flags) if f))
+
+    return {'ok': True, 'islands': islands, 'H': H, 'W': W, 'area_sum': area_sum}
+
+def plate_guard_heuristics(solid,
+                           axis_dir=gp_Dir(1,0,0),
+                           n_samples=9,
+                           rel_end_margin=0.06,
+                           abs_min_margin=15.0,
+                           area_fill_min=0.85,
+                           max_rel_spread=0.02,
+                           islands_frac_max=0.2):
+    """
+    Decide if a part plausibly behaves like a PLATE, using only geometry.
+    Returns (is_plausible_plate: bool, diag: dict).
+
+    Heuristics:
+      - If >1 SOLID -> not a plate (likely multi-body).
+      - Cross-section fill = area_sum / (H*W) high across slices (median >= area_fill_min).
+      - H and W vary very little along length (spread <= max_rel_spread).
+      - Slices with multiple islands (disjoint loops) are rare (fraction <= islands_frac_max).
+    """
+    # Multi-body quick test
+    n_solids = count_solids_in_shape(solid)
+    if n_solids > 1:
+        return False, {"reason": "multi_body_shape", "n_solids": n_solids}
+
+    # Interior sampling window
+    bb = Bnd_Box(); brepbndlib.Add(solid, bb)
+    xmin, ymin, zmin, xmax, ymax, zmax = bb.Get()
+    L = xmax - xmin
+    if L <= 1e-9:
+        return False, {"reason": "degenerate_length"}
+
+    margin = max(rel_end_margin*L, abs_min_margin)
+    x_lo = xmin + margin
+    x_hi = xmax - margin
+    if x_hi <= x_lo:
+        x_lo = xmin + 0.2*L
+        x_hi = xmax - 0.2*L
+
+    # sample
+    xs, fills, Hs, Ws, islands_flags = [], [], [], [], []
+    for i in range(max(5, n_samples)):  # force >=5 samples
+        t = (i + 0.5) / max(5, n_samples)
+        x0 = x_lo + t*(x_hi - x_lo)
+        stats = _section_islands_stats(solid, x0, axis_dir=axis_dir)
+        if not stats.get('ok'):
+            continue
+        H, W, area_sum = stats['H'], stats['W'], stats['area_sum']
+        if H <= 0 or W <= 0:
+            continue
+        fill = float(area_sum / (H * W))
+        xs.append(x0); fills.append(fill); Hs.append(H); Ws.append(W)
+        islands_flags.append(stats['islands'] > 1)
+
+    if not fills:
+        return False, {"reason": "no_valid_sections"}
+
+    import statistics as _st
+    fill_med = float(_st.median(fills))
+    H_spread = (max(Hs) - min(Hs)) / max(_st.median(Hs), 1e-9)
+    W_spread = (max(Ws) - min(Ws)) / max(_st.median(Ws), 1e-9)
+    islands_frac = sum(1 for f in islands_flags if f) / len(islands_flags)
+
+    plausible = (
+        fill_med >= area_fill_min and
+        H_spread <= max_rel_spread and
+        W_spread <= max_rel_spread and
+        islands_frac <= islands_frac_max
+    )
+
+    diag = {
+        "n_samples": len(fills),
+        "fill_median": fill_med,
+        "H_rel_spread": float(H_spread),
+        "W_rel_spread": float(W_spread),
+        "islands_fraction": float(islands_frac)
+    }
+    return plausible, diag
+
+
+# --- Helper: identify OUTER wire (largest area) and any INNER wires (holes) ---
+def _extract_outer_and_holes(edges_shape, plane, tol=1e-6):
+    """
+    From a section edge soup, return:
+      outer_wire (TopoDS_Wire or None),
+      inner_wires (list of TopoDS_Wire),
+      area_outer (float, gross area from outer wire only).
+    """
+    fb = ShapeAnalysis_FreeBounds(edges_shape, tol, False, False)
+    seq = fb.GetClosedWires()
+    if seq is None or not hasattr(seq, "Length") or seq.Length() == 0:
+        return None, [], 0.0
+
+    wires = []
+    for i in range(1, seq.Length()+1):
+        s = seq.Value(i)
+        if s.ShapeType() == TopAbs_WIRE:
+            wires.append(topods.Wire(s))
+    if not wires:
+        return None, [], 0.0
+
+    # OUTER = wire with maximum unsigned area on the plane
+    areas = [_wire_area_on_plane(plane, w) for w in wires]
+    i_outer = int(max(range(len(areas)), key=lambda k: areas[k]))
+    outer = wires[i_outer]
+    inners = [w for j, w in enumerate(wires) if j != i_outer]
+    return outer, inners, float(areas[i_outer])
+
 
 def robust_align_solid_from_geometry(solid, tol=1e-3):
     """
@@ -267,69 +470,124 @@ from OCC.Core.BRepBndLib import brepbndlib
 
 def compute_section_area(solid, axis_dir=gp_Dir(1, 0, 0), sample_pos=None, tol=1e-6):
     """
-    Computes cross-sectional area of a solid by slicing it with a plane
-    and measuring the area of the largest closed wire.
-    Falls back to volume/length if wire construction fails.
+    Returns GROSS cross-sectional area (outer boundary only).
+
+    Behaviour:
+      - If sample_pos is given (offset from xmin): single slice.
+      - Else (robust mode): sample along the length, cluster CSAs by similarity,
+        take the median of the largest cluster (most commonly seen section).
     """
-    # 1. Bounding box
+    # --- bounds ---
     bbox = Bnd_Box()
     brepbndlib.Add(solid, bbox)
     xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-    length = xmax - xmin
-    if length <= tol:
+    L = xmax - xmin
+    if L <= 1e-12:
         return 0.0
 
-    # 2. Section plane
-    x0 = xmin + (length / 2.0 if sample_pos is None else sample_pos)
-    plane = gp_Pln(gp_Ax3(gp_Pnt(x0, 0, 0), axis_dir))
+    # internal helper: gross CSA at absolute x0 (clamped to interior)
+    def _gross_area_at_x(x0_abs: float) -> float | None:
+        eps = max(1e-3, 1e-4 * L)  # avoid grazing ends
+        x0 = max(xmin + eps, min(xmax - eps, x0_abs))
+        plane = gp_Pln(gp_Ax3(gp_Pnt(x0, 0, 0), axis_dir))
 
-    # 3. Section operation
-    section = BRepAlgoAPI_Section(solid, plane)
-    section.ComputePCurveOn1(True)
-    section.Approximation(True)
-    section.Build()
-    if not section.IsDone():
-        raise RuntimeError("Section operation failed")
+        sec = BRepAlgoAPI_Section(solid, plane)
+        sec.ComputePCurveOn1(True)
+        sec.Approximation(True)
+        # sec.SetFuzzyValue(tol)  # uncomment if loops are slightly gappy
+        sec.Build()
+        if not sec.IsDone():
+            return None
 
-    edges_shape = section.Shape()
+        outer, inners, area_outer = _extract_outer_and_holes(sec.Shape(), plane, tol=tol)
+        if outer is None:
+            return None
+        return float(area_outer)  # GROSS (outer only)
 
-    # 4. Extract closed wires safely
-    fb = ShapeAnalysis_FreeBounds(edges_shape, tol, False, False)
-    closed_wires_seq = fb.GetClosedWires()
-
-    if (
-        closed_wires_seq is None
-        or not hasattr(closed_wires_seq, "Length")
-        or closed_wires_seq.Length() == 0
-    ):
-        # fallback: use volume / length
-        props = GProp_GProps()
-        brepgprop.VolumeProperties(solid, props)
-        volume = props.Mass()
-        return volume / length
-
-    # 5. Compute area from the largest closed wire
-    max_area = 0.0
-    try:
-        for i in range(1, closed_wires_seq.Length() + 1):
-            shape = closed_wires_seq.Value(i)
-            if shape.ShapeType() != TopAbs_EDGE and hasattr(topods, "Wire"):
-                wire = topods.Wire(shape)
-                face = BRepBuilderAPI_MakeFace(plane, wire).Face()
-                props = GProp_GProps()
-                brepgprop.SurfaceProperties(face, props)
-                area = abs(props.Mass())
-                if area > max_area:
-                    max_area = area
-    except Exception as e:
-        print("⚠️ Error computing area from wires:", e)
+    # --- single-slice path (explicit sample_pos) ---
+    if sample_pos is not None:
+        x0_abs = xmin + float(sample_pos)
+        a = _gross_area_at_x(x0_abs)
+        if a is not None:
+            return a
         # fallback
-        props = GProp_GProps()
-        brepgprop.VolumeProperties(solid, props)
-        volume = props.Mass()
-        return volume / length
+        gpv = GProp_GProps()
+        brepgprop.VolumeProperties(solid, gpv)
+        return gpv.Mass() / max(L, 1e-9)
 
-    return max_area if max_area > 0 else (volume / length)
+    # --- robust multi-slice path ---
+    # force a minimum of 5 samples; default target is 21 for stability
+    n_samples_target = 21
+    n_samples = max(5, n_samples_target)
+
+    # interior sampling window (skip ends)
+    rel_end_margin = 0.06
+    abs_min_margin = 15.0
+    margin = max(rel_end_margin * L, abs_min_margin)
+    x_lo = xmin + margin
+    x_hi = xmax - margin
+    if x_hi <= x_lo:  # very short parts: shrink margin
+        x_lo = xmin + 0.2 * L
+        x_hi = xmax - 0.2 * L
+
+    # collect CSA samples
+    vals = []
+    xs = []
+    for i in range(n_samples):
+        t = (i + 0.5) / n_samples
+        x0_abs = x_lo + t * (x_hi - x_lo)
+        a = _gross_area_at_x(x0_abs)
+        if a is not None:
+            vals.append(a)
+            xs.append(x0_abs)
+
+    if not vals:
+        # ultimate fallback: volume/length
+        gpv = GProp_GProps()
+        brepgprop.VolumeProperties(solid, gpv)
+        return gpv.Mass() / max(L, 1e-9)
+
+    # --- cluster by relative tolerance, pick the largest cluster, then take median ---
+    import statistics
+    area_rel_tol = 0.03  # 3% similarity defines "same section" for clustering
+
+    clusters: list[dict] = []  # each: {'ref': float, 'vals': list[float]}
+    for a in sorted(vals):
+        placed = False
+        for c in clusters:
+            ref = c['ref']
+            if abs(a - ref) <= area_rel_tol * max(ref, 1e-9):
+                c['vals'].append(a)
+                # keep 'ref' near cluster center to avoid drift from outliers
+                c['ref'] = statistics.median(c['vals'])
+                placed = True
+                break
+        if not placed:
+            clusters.append({'ref': a, 'vals': [a]})
+
+    clusters.sort(key=lambda c: len(c['vals']), reverse=True)
+    core = clusters[0]['vals'] if clusters else vals
+
+    # robust representative of the "most common" cluster
+    med_core = float(statistics.median(core))
+    # If you literally want the "average of the most common", swap to:
+    # med_core = float(sum(core) / len(core))
+
+    # optional diagnostics (only if you've defined CSA_DIAG elsewhere)
+    CSA_DIAG.clear()
+    CSA_DIAG.update({
+        "mode": "robust_cluster",
+        "n_total": len(vals),
+        "n_core": len(core),
+        "median_core": med_core,
+        "min_core": float(min(core)),
+        "max_core": float(max(core)),
+        "rel_spread_core": float((max(core) - min(core)) / max(med_core, 1e-9)),
+        "positions": xs,
+        "area_rel_tol": area_rel_tol,
+    })
+
+    return med_core
 
 
 
