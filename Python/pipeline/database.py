@@ -57,44 +57,31 @@ def dump_df_to_supabase(df: pd.DataFrame, table_name="parts", projectnumber: str
     print(f"✅ Successfully inserted {total} rows into `{table_name}`")
 
 
-def normalize_report_df(df: pd.DataFrame, project_id,
-                        keep_only: List[str] = None) -> pd.DataFrame:
-    # print(df.columns)
+def normalize_report_df(df: pd.DataFrame, project_id, keep_only: list[str] | None = None) -> pd.DataFrame:
     """
-    Rename and clean up the report DataFrame so it matches the `parts` table schema.
-    
-    - Renames columns from:
-        'Item ID', 'Item Type', 'STEP File', 'Image', 'Drilling Drawing',
-        'DXF Thumb', 'Profile DXF', 'NC1 File', 'BREP', 'Mass (kg)',
-        'X (mm)', 'Y (mm)', 'Z (mm)', 'Issues', 'Hash', 'Section Shape'
-      to:
-        item_id, item_type, step_file, image, drilling_drawing,
-        dxf_thumb, profile_dxf, nc1_file, brep, mass_kg,
-        x_mm, y_mm, z_mm, issues, hash, section_shape
-    
-    - If `keep_only` is provided, drops all columns *not* in that list after renaming.
-    
-    Returns the cleaned DataFrame.
+    Map pipeline columns to the `parts` table columns.
+    Uses the *current* report_df headers you showed.
     """
     mapping = {
-        "Item ID":          "item_id",
-        "Item Type":        "item_type",
-        "STEP File":        "step_file",
-        "Image":            "image",
-        "Drilling Drawing": "drilling_drawing",
-        "DXF Thumb":        "dxf_thumb",
-        "Profile DXF":      "profile_dxf",
-        "NC1 File":         "nc1_file",
-        "BREP":             "brep",
-        "Mass (kg)":        "mass_kg",
-        "X (mm)":           "x_mm",
-        "Y (mm)":           "y_mm",
-        "Z (mm)":           "z_mm",
-        "Issues":           "issues",
-        "Hash":             "hash",
-        "Section Shape":    "section_shape",
-        "Assembly Hash":    "source_model_hash",                     
-        "signature_hash" :  "signature_hash",
+        "name":             "item_id",
+        "obj_type":         "item_type",
+        "step_path":        "step_file",
+        "stl_path":         "stl_file",
+        "thumb_path":       "image",
+        "drilling_path":    "drilling_drawing",
+        "dxf_path":         "profile_dxf",
+        "nc1_path":         "nc1_file",
+        "brep_path":        "brep",
+        "mass":             "mass_kg",
+        "obb_x":            "x_mm",
+        "obb_y":            "y_mm",
+        "obb_z":            "z_mm",
+        "issues":           "issues",
+        "hash":             "hash",
+        "dxf_thumb_path":   "dxf_thumb",
+        "section_shape":    "section_shape",
+        "assembly_hash":    "source_model_hash",
+        "signature_hash":   "signature_hash",
         "volume":           "volume",
         "surface_area":     "surface_area",
         "bbox_x":           "bbox_x",
@@ -106,24 +93,37 @@ def normalize_report_df(df: pd.DataFrame, project_id,
         "centroid_x":       "centroid_x",
         "centroid_y":       "centroid_y",
         "centroid_z":       "centroid_z",
-        "chirality":        "chirality"
+        "chirality":        "chirality",
     }
-    
-    # 1) Rename
-    df = df.rename(columns=mapping)
 
-    # print(df.columns)
-    
-    # 2) Optionally drop any extra columns
+    out = df.rename(columns=mapping).copy()
+
+    # Ensure projectnumber exists (your table uses this)
+    out["projectnumber"] = project_id
+
+    # Types/coercions (optional, but tends to avoid DB type errors)
+    numeric_cols = [
+        "mass_kg","x_mm","y_mm","z_mm","volume","surface_area",
+        "bbox_x","bbox_y","bbox_z","inertia_e1","inertia_e2","inertia_e3",
+        "centroid_x","centroid_y","centroid_z","chirality",
+    ]
+    for c in numeric_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    # File path columns -> strings (or empty)
+    file_cols = ["step_file","stl_file","image","drilling_drawing","profile_dxf","nc1_file","brep","dxf_thumb"]
+    for c in file_cols:
+        if c in out.columns:
+            out[c] = out[c].fillna("").astype(str)
+
+    # Optionally keep only a subset
     if keep_only is not None:
-        # Always keep project_id (if present), plus imported_at if you had it
-        protected = {"projectnumber", "imported_at"}
+        protected = {"projectnumber"}  # always keep
         allowed = set(keep_only) | protected
-        df = df.loc[:, df.columns.intersection(allowed)]
-    
-    df['projectnumber'] = project_id
+        out = out.loc[:, [c for c in out.columns if c in allowed]]
 
-    return df
+    return out
 
 
 import os

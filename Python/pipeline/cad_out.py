@@ -25,6 +25,9 @@ from OCC.Core.GCPnts import GCPnts_UniformAbscissa
 from OCC.Core.GeomAbs import GeomAbs_Line, GeomAbs_Circle
 from OCC.Core.gp import gp_Ax3, gp_Pnt, gp_Dir
 
+from OCC.Core.StlAPI import StlAPI_Writer
+from OCC.Core.Bnd import Bnd_Box
+from OCC.Core.BRepBndLib import brepbndlib
 
 # Optional: DXF rendering helper (qsave may not exist)
 try:
@@ -880,3 +883,44 @@ def _loops_and_circles_to_segments(loops, circles, N=64):
             p2 = (cx + r*np.cos(a1), cy + r*np.sin(a1))
             segs.append((p1, p2))
     return segs
+
+def export_solid_to_stl(
+    shape,
+    out_dir,
+    name,
+    linear_deflection=None,   # mm (None = auto from bbox)
+    angular_deflection=0.35,  # radians (~20°) – smaller = finer
+    relative=True,
+    parallel=True,
+    ascii_mode=False          # False = binary (smaller, faster)
+):
+    """
+    Meshes 'shape' and writes <out_dir>/<name>.stl. Returns the file path.
+    Units: STL is unitless; you’re exporting whatever the model units are
+    (mm in your pipeline).
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stl_path = out_dir / f"{name}.stl"
+
+    # Pick a sensible default linear deflection from the model size.
+    if linear_deflection is None:
+        bb = Bnd_Box(); brepbndlib.Add(shape, bb)
+        xmin, ymin, zmin, xmax, ymax, zmax = bb.Get()
+        diag = ((xmax-xmin)**2 + (ymax-ymin)**2 + (zmax-zmin)**2) ** 0.5
+        # ~0.2% of part diagonal, but at least 0.1 mm
+        linear_deflection = max(0.002 * diag, 0.10)
+
+    # Create triangulation
+    mesher = BRepMesh_IncrementalMesh(shape, linear_deflection, relative, angular_deflection, parallel)
+    mesher.Perform()
+    if hasattr(mesher, "IsDone") and not mesher.IsDone():
+        raise RuntimeError("STL meshing failed")
+
+    # Write STL
+    writer = StlAPI_Writer()
+    writer.SetASCIIMode(ascii_mode)
+    if not writer.Write(shape, str(stl_path)):
+        raise RuntimeError("Failed to write STL")
+
+    return str(stl_path)

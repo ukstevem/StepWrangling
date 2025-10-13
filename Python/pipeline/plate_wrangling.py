@@ -1,3 +1,4 @@
+from typing import Optional
 import math
 import numpy as np
 from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3, gp_Trsf
@@ -10,13 +11,14 @@ from OCC.Core.GProp import GProp_GProps
 from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.GeomLProp import GeomLProp_SLProps
+from OCC.Core.TopoDS import topods
 
 from pipeline.geometry_utils import plate_guard_heuristics
 
 THICKNESS_LIMIT_MM = 101.0
-mat_density = 0.000000784
+mat_density = 0.000000784  # kg / mm^3 (≈ 7.84 g/cc)
 
-# ---------- small helpers ----------
+# ---------------- small helpers ----------------
 def _unit(v):
     v = np.asarray(v, float)
     n = np.linalg.norm(v)
@@ -27,11 +29,7 @@ def _proj_inplane_np(v_np, z_np):
     return _unit(v_np - np.dot(v_np, z_np) * z_np)
 
 def _acute_inplane_delta_deg(a_dir, b_dir, z_np):
-    """
-    Acute (0..90] in-plane angle between OCC directions a_dir, b_dir,
-    measured in the plane orthogonal to z_np. Sign and 180° symmetry removed.
-    Returns None if projection degenerates.
-    """
+    """Acute in-plane angle between OCC directions a_dir, b_dir, measured in plane ⟂ z_np."""
     a = _proj_inplane_np(np.array([a_dir.X(), a_dir.Y(), a_dir.Z()], float), z_np)
     b = _proj_inplane_np(np.array([b_dir.X(), b_dir.Y(), b_dir.Z()], float), z_np)
     if np.linalg.norm(a) < 1e-12 or np.linalg.norm(b) < 1e-12:
@@ -40,13 +38,8 @@ def _acute_inplane_delta_deg(a_dir, b_dir, z_np):
     acute  = abs((signed + 180.0) % 360.0 - 180.0)
     return min(acute, 180.0 - acute)
 
-def _angle_deg_between(a, b):
-    a = _unit(a); b = _unit(b)
-    c = float(np.clip(np.dot(a, b), -1.0, 1.0))
-    return math.degrees(math.acos(c))
-
-def _yaw_deg_from_xdir(xdir: gp_Dir) -> float | None:
-    """Yaw of X relative to world +X in XY-plane (pre-transform)."""
+def _yaw_deg_from_xdir(xdir: gp_Dir) -> Optional[float]:
+    """Yaw of X relative to world +X in XY-plane."""
     xv = np.array([xdir.X(), xdir.Y(), 0.0])
     n = np.linalg.norm(xv)
     if n < 1e-12:
@@ -63,15 +56,16 @@ def compute_section_and_length_and_origin_from_obb(solid):
 
 def get_face_area(face):
     props = GProp_GProps()
-    brepgprop.SurfaceProperties(face, props)
+    brepgprop.SurfaceProperties(topods.Face(face), props)
     return props.Mass()
 
 def is_planar_by_curvature(face, tol=1e-4):
+    face = topods.Face(face)
     surface = BRep_Tool.Surface(face)
     try:
         umin, umax, vmin, vmax = surface.Bounds()
-        u_mid = (umin + umax) / 2
-        v_mid = (vmin + vmax) / 2
+        u_mid = (umin + umax) / 2.0
+        v_mid = (vmin + vmax) / 2.0
         props = GeomLProp_SLProps(surface, u_mid, v_mid, 2, tol)
         if not props.IsCurvatureDefined():
             return False
@@ -80,10 +74,11 @@ def is_planar_by_curvature(face, tol=1e-4):
         return False
 
 def get_face_normal(face):
+    face = topods.Face(face)
     surface = BRep_Tool.Surface(face)
     umin, umax, vmin, vmax = surface.Bounds()
-    u_mid = (umin + umax) / 2
-    v_mid = (vmin + vmax) / 2
+    u_mid = (umin + umax) / 2.0
+    v_mid = (vmin + vmax) / 2.0
     props = GeomLProp_SLProps(surface, u_mid, v_mid, 1, 1e-6)
     if not props.IsNormalDefined():
         return None
@@ -91,60 +86,53 @@ def get_face_normal(face):
 
 def _world_extents_mm(shape):
     obb = Bnd_OBB()
-    brepbndlib.AddOBB(shape, obb, True, True)  # triangulation & use-shape-loc
+    brepbndlib.AddOBB(shape, obb, True, True)
     return 2.0 * obb.XHSize(), 2.0 * obb.YHSize(), 2.0 * obb.ZHSize()
 
-# ---------- main ----------
+# ---------------- main ----------------
 def align_plate_to_xy_plane(
     solid,
-    prefer_dir_x: gp_Dir | None = None,
+    prefer_dir_x: Optional[gp_Dir] = None,
     lock_x: bool = True,
     square_rel_tol: float = 1e-3,
-    warn_obb_delta_deg: float | None = 1.0,  # set None to disable warning
-    # NEW: optional absolute thickness gate (disabled by default)
-    thickness_limit_mm: float | None = None,
+    warn_obb_delta_deg: Optional[float] = 1.0,  # set None to disable warning
+    thickness_limit_mm: Optional[float] = None,  # None => no absolute gate
 ):
     """
     Final plate alignment WITHOUT reintroducing random yaw:
       - Z = +largest planar face normal
       - X = locked to prefer_dir_x if provided, else:
-          * if near-square/round: projected world +X (deterministic)
+          * if near-square: projected world +X (deterministic)
           * else: projected OBB long axis
-      - Right-handed basis; map frame -> world
+      - Right-handed basis; map local frame -> world
 
-    Returns (9):
+    Returns:
       (is_plate, aligned_solid, dstv_ax3, thickness_mm, length_mm, width_mm, step_mass, message, sig)
-      where sig = {
+
+      sig = {
         'yaw_deg': float|None,
         'obb_vs_x_deg': float|None,
-        'x_choice': 'prefer'|'worldX'|'obb_projected'|'fallback',
+        'x_choice': 'prefer'|'worldX'|'obb_projected'|'fallback'|'n/a',
         'square_guard': bool,
         'dims_mm': {'L':..., 'W':..., 'T':...}
       }
-
-    Notes:
-      * thickness_mm is ALWAYS the smallest of the three aligned extents.
-      * thickness_limit_mm is optional; if None, no absolute thickness gate is applied.
     """
-
-    def align_plate_to_xy_plane(solid, *args, **kwargs):
-        # --- Plate guardrail ---
-        ok, diag = plate_guard_heuristics(solid, axis_dir=gp_Dir(1,0,0))
-        if not ok:
-            # Keep your return signature; veto plate early
+    try:
+        # ---- guard: bail early if it doesn't look like a plate (or multi-body) ----
+        ok_guard, diag_guard = plate_guard_heuristics(solid)
+        if not ok_guard:
             return (
-                False,          # is_plate
-                None,           # final_aligned_solid
-                None,           # ax3
-                0.0, 0.0, 0.0,  # thickness_mm, length_mm, width_mm
-                0.0,            # step_mass
-                f"Plate guard veto: {diag}",  # msg
-                None            # sig / extra
+                False,      # is_plate
+                None,       # aligned_solid
+                None,       # dstv_ax3
+                0.0, 0.0, 0.0,  # T, L, W
+                0.0,        # step_mass
+                f"Plate guard veto: {diag_guard}",
+                {'yaw_deg': None, 'obb_vs_x_deg': None, 'x_choice': 'n/a', 'square_guard': False,
+                 'dims_mm': {'L': 0.0, 'W': 0.0, 'T': 0.0}}
             )
 
-
-    try:
-        # --- dimensions from OBB (not yaw) on the INPUT solid ---
+        # --- OBB on INPUT solid (for initial dims & long axis) ---
         center, half_extents, axes = compute_section_and_length_and_origin_from_obb(solid)
         idx_sorted = sorted(range(3), key=lambda i: -half_extents[i])
         length_idx, width_idx, thickness_idx = idx_sorted
@@ -152,12 +140,12 @@ def align_plate_to_xy_plane(
         width_mm     = 2.0 * half_extents[width_idx]
         thickness_mm = 2.0 * half_extents[thickness_idx]
 
-        # mass from volume (assumes mat_density is defined elsewhere)
+        # mass from volume
         props_v = GProp_GProps()
         brepgprop.VolumeProperties(solid, props_v)
         step_mass = props_v.Mass() * mat_density
 
-        # --- largest planar face normal -> Z ---
+        # --- pick largest planar face; its normal => Z ---
         faces = []
         exp = TopExp_Explorer(solid, TopAbs_FACE)
         while exp.More():
@@ -165,6 +153,7 @@ def align_plate_to_xy_plane(
             if is_planar_by_curvature(f):
                 faces.append(f)
             exp.Next()
+
         if not faces:
             sig = {'yaw_deg': None, 'obb_vs_x_deg': None, 'x_choice': 'n/a', 'square_guard': False,
                    'dims_mm': {'L': length_mm, 'W': width_mm, 'T': thickness_mm}}
@@ -197,7 +186,7 @@ def align_plate_to_xy_plane(
 
         is_square = False
         if x_np is None:
-            # near-square / round check
+            # near-square check to avoid arbitrary yaw
             is_square = abs(length_mm - width_mm) <= max(square_rel_tol * max(length_mm, width_mm), 1e-6)
             if is_square:
                 v = proj_to_plane(np.array([1.0, 0.0, 0.0], float))  # world +X
@@ -206,10 +195,10 @@ def align_plate_to_xy_plane(
                 x_np = v
                 x_choice = 'worldX'
             else:
-                a = axes[length_idx]
+                a = axes[length_idx]  # long axis
                 v = proj_to_plane(np.array([a.X(), a.Y(), a.Z()], float))
                 if np.linalg.norm(v) < 1e-12:
-                    # emergency: any X orthogonal to Z
+                    # emergency: choose X orthogonal to Z
                     vdir = gp_Ax3(gp_Pnt(0,0,0), dir_z).XDirection()
                     v = proj_to_plane(np.array([vdir.X(), vdir.Y(), vdir.Z()], float))
                     x_choice = 'fallback'
@@ -217,11 +206,11 @@ def align_plate_to_xy_plane(
                     x_choice = 'obb_projected'
                 x_np = v
 
-        # stable sign toward +world X when possible
+        # stable sign toward +world X when feasible
         if np.dot(x_np, np.array([1.0, 0.0, 0.0])) < 0:
             x_np = -x_np
 
-        # right-handed: Y = Z × X ; then X = Y × Z (re-orthonormalize)
+        # right-handed: Y = Z × X ; then re-orthonormalize X = Y × Z
         y_np = _unit(np.cross(z_np, x_np))
         if np.dot(np.cross(x_np, y_np), z_np) < 0:
             y_np = -y_np
@@ -231,11 +220,9 @@ def align_plate_to_xy_plane(
 
         # signature bits
         yaw_deg = _yaw_deg_from_xdir(dir_x)
-
-        # compare OBB long axis to locked X as an ACUTE, IN-PLANE angle
         obb_vs_x_deg = None
         try:
-            obb_long = axes[length_idx]  # gp_Dir from source OBB
+            obb_long = axes[length_idx]
             obb_vs_x_deg = _acute_inplane_delta_deg(dir_x, obb_long, z_np)
         except Exception:
             pass
@@ -249,12 +236,11 @@ def align_plate_to_xy_plane(
         tr.SetTransformation(dstv_ax3, world_ax3)
         transformed = BRepBuilderAPI_Transform(solid, tr, True).Shape()
 
-        # --- recompute dims from the final orientation and ENFORCE T=min(L,W,T) ---
-        Lx, Ly, Lz = _world_extents_mm(transformed)  # extents along global X,Y,Z
+        # --- recompute dims from final orientation; enforce T = min(L, W, T) ---
+        Lx, Ly, Lz = _world_extents_mm(transformed)
         L, W, T = sorted((float(Lx), float(Ly), float(Lz)), reverse=True)  # L ≥ W ≥ T
         length_mm, width_mm, thickness_mm = L, W, T
 
-        # update signature dims to FINAL numbers
         sig = {
             'yaw_deg': yaw_deg,
             'obb_vs_x_deg': obb_vs_x_deg,
@@ -263,10 +249,20 @@ def align_plate_to_xy_plane(
             'dims_mm': {'L': length_mm, 'W': width_mm, 'T': thickness_mm},
         }
 
-        # Optional absolute thickness gate (disabled by default)
-        if thickness_limit_mm is not None and thickness_mm > thickness_limit_mm:
+        # absolute thickness gate (optional)
+        limit = thickness_limit_mm if thickness_limit_mm is not None else THICKNESS_LIMIT_MM
+        if limit is not None and thickness_mm > limit:
             return (False, transformed, dstv_ax3, thickness_mm, length_mm, width_mm, step_mass,
                     "Too thick for plate", sig)
+
+        # optional warning if OBB long axis disagrees with chosen X (in-plane)
+        if (
+            warn_obb_delta_deg is not None
+            and obb_vs_x_deg is not None
+            and obb_vs_x_deg > warn_obb_delta_deg
+            and not is_square   # <-- suppress for near-square parts (expected ambiguity)
+        ):
+            print(f"⚠️ OBB long vs chosen X differs by {obb_vs_x_deg:.2f}°")
 
         return (True, transformed, dstv_ax3, thickness_mm, length_mm, width_mm, step_mass,
                 "Plate aligned to XY; thickness = min(X,Y,Z)", sig)
@@ -274,4 +270,4 @@ def align_plate_to_xy_plane(
     except Exception as e:
         sig = {'yaw_deg': None, 'obb_vs_x_deg': None, 'x_choice': 'error', 'square_guard': False,
                'dims_mm': {'L': None, 'W': None, 'T': None}}
-        return False, None, None, None, None, None, None, f"Unhandled error: {e}", sig
+        return False, None, None, 0.0, 0.0, 0.0, 0.0, f"Unhandled error: {e}", sig

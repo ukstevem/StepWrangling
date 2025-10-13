@@ -101,9 +101,10 @@ def create_project_directories(project_number, net_root, fb_root):
     dxf_path = os.path.join(cad_path, "dxf")
     dxf_thumb = os.path.join(dxf_path, "thumbs")
     thumb_path = os.path.join(base_path, "thumbs")
+    stl_path = os.path.join(cad_path, "stl")
 
 
-    for path in [nc1_path, reports_path, drilling_path, cad_path, thumb_path, step_path, brep_path, dxf_path, dxf_thumb]:
+    for path in [nc1_path, reports_path, drilling_path, cad_path, thumb_path, step_path, stl_path, brep_path, dxf_path, dxf_thumb]:
         os.makedirs(path, exist_ok=True)
 
-    return base_path, nc1_path, reports_path, drilling_path, cad_path, thumb_path, step_path, brep_path, dxf_path, dxf_thumb
+    return base_path, nc1_path, reports_path, drilling_path, cad_path, thumb_path, step_path, stl_path, brep_path, dxf_path, dxf_thumb
