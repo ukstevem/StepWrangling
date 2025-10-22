@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DSTV Assembly Viewer — Minimal (Absolute Layout)</title>
+  <script type="importmap">
+    {"imports":{
+      "three":"https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"
+    }}
+  </script>
+  <style>
+    :root{--bg:#0b0f14;--panel:#111822;--text:#e7eef7;--muted:#93a4b7;--accent:#7cd1ff}
+    html,body{margin:0;height:100vh;overflow:hidden;background:var(--bg);color:var(--text);font:14px/1.4 ui-sans-serif,system-ui}
+    /* ABSOLUTE, BULLETPROOF LAYOUT */
+    header{position:absolute;left:0;right:0;top:0;height:48px;display:flex;align-items:center;gap:10px;padding:8px 12px;background:linear-gradient(180deg,#0d141c,#0a1016);border-bottom:1px solid #0f1a26;z-index:10}
+    #side{position:absolute;left:0;top:48px;bottom:0;width:320px;background:var(--panel);border-right:1px solid #0f1a26;overflow:auto;z-index:5}
+    #main{position:absolute;left:320px;right:0;top:48px;bottom:0;background:#0b0f14}
+    canvas{position:absolute;inset:0;display:block;width:100%;height:100%}
+    .btn{padding:6px 10px;border:1px solid #1f2e40;background:#0e1620;border-radius:10px;color:var(--text);cursor:pointer}
+    .row{display:flex;gap:8px;align-items:center;margin:8px 10px}
+    .row label{min-width:92px;color:var(--muted)}
+    input{flex:1;min-width:0;background:#0f1620;border:1px solid #1f2e40;border-radius:8px;color:var(--text);padding:6px}
+    h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;margin:10px;color:var(--muted)}
+    #hud{position:absolute;left:10px;bottom:10px;background:rgba(0,0,0,.5);border:1px solid #183046;border-radius:12px;padding:8px 10px;color:#cfe6ff;z-index:6;max-width:40vw}
+    #log{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;white-space:pre-wrap;max-height:20vh;overflow:auto}
+  </style>
+</head>
+<body>
+  <header>
+    <strong>DSTV Viewer (Minimal)</strong>
+    <span id="status" class="btn" style="pointer-events:none">Idle</span>
+    <div style="flex:1"></div>
+    <button class="btn" id="fit">Fit</button>
+    <button class="btn" id="debug">Debug cube</button>
+  </header>
+
+  <div id="side">
+    <h2>Data</h2>
+    <div class="row"><label>Manifest</label><input id="manifestUrl" value="/data/manifest.json"></div>
+    <div class="row"><label>Base URL</label><input id="baseUrl" value="/data/"></div>
+    <div class="row"><button class="btn" id="load">Load</button></div>
+
+    <h2>Notes</h2>
+    <div class="row" style="flex-direction:column;align-items:stretch">
+      <div>Per-instance GLB supported via <code>instances[i].glb_url</code>. Fallback to per-def <code>parts[i].glb_url</code>. Units: <code>MM</code> or <code>M</code>.</div>
+    </div>
+  </div>
+
+  <div id="main">
+    <canvas id="c"></canvas>
+    <div id="hud"><div><strong>Hints:</strong> orbit=right drag, pan=middle, wheel=zoom</div><div id="log"></div></div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+    // --- DOM
+    const canvas = document.getElementById('c');
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const manifestInput = document.getElementById('manifestUrl');
+    const baseUrlInput = document.getElementById('baseUrl');
+
+    const setStatus = t => statusEl.textContent = t;
+    const log = t => { logEl.textContent = String(t); console.log('[viewer]', t); };
+
+    // --- THREE
+    const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+    renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#0b0f14');
+
+    const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 1e6);
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(new RoomEnvironment()).texture;
+
+    const grid = new THREE.GridHelper(20,20,0x335577,0x223344); scene.add(grid);
+    const axes = new THREE.AxesHelper(2); axes.visible=false; scene.add(axes);
+    const dir = new THREE.DirectionalLight(0xffffff,0.8); dir.position.set(5,8,3); scene.add(dir);
+    const hemi = new THREE.HemisphereLight(0xffffff,0x222233,0.3); scene.add(hemi);
+
+    function sizeFromMain(){
+      const main = document.getElementById('main');
+      const w = Math.max(1, main.clientWidth);
+      const h = Math.max(1, main.clientHeight);
+      camera.aspect = w/h; camera.updateProjectionMatrix();
+      renderer.setSize(w,h,false);
+    }
+    new ResizeObserver(sizeFromMain).observe(document.getElementById('main'));
+    window.addEventListener('resize', sizeFromMain);
+    requestAnimationFrame(sizeFromMain);
+
+    renderer.setAnimationLoop(()=>{ controls.update(); renderer.render(scene, camera); });
+
+    // --- helpers
+    const loader = new GLTFLoader();
+    const repCache = new Map(); // def_id -> rep
+    const nodes = new Map(); // occ_id -> Object3D
+    let unitScale = 1.0;
+
+    function normalizeBase(base){
+      if(!base) return window.location.origin + '/';
+      try{ const u=new URL(base); if(!u.pathname.endsWith('/')) u.pathname+='/'; return u.toString(); }
+      catch{ if(base.startsWith('/')){ const u=new URL(window.location.origin+base); if(!u.pathname.endsWith('/')) u.pathname+='/'; return u.toString(); }
+      const u=new URL(base, window.location.href); if(!u.pathname.endsWith('/')) u.pathname+='/'; return u.toString(); }
+    }
+    function resolveUrl(pathOrUrl, base){ try{ return new URL(pathOrUrl).toString(); }catch{ return new URL(pathOrUrl, normalizeBase(base)).toString(); } }
+
+    function applyMatrix4(obj, M){
+      if(!M){ return; }
+      const mat = new THREE.Matrix4();
+      mat.set(M[0][0],M[0][1],M[0][2],M[0][3], M[1][0],M[1][1],M[1][2],M[1][3], M[2][0],M[2][1],M[2][2],M[2][3], M[3][0],M[3][1],M[3][2],M[3][3]);
+      obj.applyMatrix4(mat);
+    }
+
+    function fitSceneToObjects(objs){
+      const box = new THREE.Box3(); objs.forEach(o=> box.expandByObject(o)); if(box.isEmpty()) return;
+      const size = new THREE.Vector3(); box.getSize(size); const center = new THREE.Vector3(); box.getCenter(center);
+      const radius = Math.max(size.x,size.y,size.z)*0.6 + 1e-3;
+      controls.target.copy(center);
+      camera.position.copy(center).add(new THREE.Vector3(1.6,1.0,1.6).multiplyScalar(radius*2.2));
+      camera.near = Math.max(radius/1000, 0.01); camera.far = radius*50; camera.updateProjectionMatrix();
+      grid.position.y = box.min.y - size.y*0.02;
+    }
+
+    async function loadRep(def){
+      if(repCache.has(def.def_id)) return repCache.get(def.def_id);
+      const url = resolveUrl(def.glb_url || (`defs/${def.def_id}.glb`), baseUrlInput.value);
+      setStatus('Loading '+def.def_id);
+      const gltf = await loader.loadAsync(url);
+      gltf.scene.traverse(o=>{ if(o.isMesh){ o.castShadow = o.receiveShadow = true; o.material.metalness ??= 0.1; o.material.roughness ??= 0.8; }});
+      repCache.set(def.def_id, { template:gltf.scene });
+      return repCache.get(def.def_id);
+    }
+    function cloneRep(rep){ return rep.template.clone(true); }
+
+    // --- load button
+    document.getElementById('load').onclick = async ()=>{
+      try{
+        setStatus('Fetching manifest');
+        const manifestUrl = resolveUrl(manifestInput.value, window.location.href);
+        const manifest = await (await fetch(manifestUrl)).json();
+
+        unitScale = (manifest.units === 'MM' || manifest.units === 'mm') ? 0.001 : 1.0;
+        // clear scene meshes (keep helpers/lights)
+        const keep = new Set([grid, axes, dir, hemi]);
+        [...scene.children].forEach(c=>{ if(!keep.has(c)) scene.remove(c); });
+        nodes.clear(); repCache.clear();
+
+        const defs = new Map(); (manifest.parts||[]).forEach(p=> defs.set(p.def_id, p));
+
+        const placed = [];
+        for(const inst of (manifest.instances||[])){
+          // prefer per-instance GLB
+          let obj=null; const instUrl = inst.glb_url || inst.glb_native || inst.glb;
+          if(instUrl){ try{ const gltf = await loader.loadAsync(resolveUrl(instUrl, baseUrlInput.value)); obj = gltf.scene.clone(true); } catch(e){ console.warn('inst load fail', instUrl, e); } }
+          if(!obj){ const def = defs.get(inst.def_id); if(!def){ console.warn('missing def', inst.def_id); continue; } const rep = await loadRep(def); obj = cloneRep(rep); }
+
+          obj.name = inst.name || inst.occ_id || inst.def_id;
+          applyMatrix4(obj, inst.matrix || [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]);
+          if(unitScale !== 1.0){ obj.scale.multiplyScalar(unitScale); obj.updateMatrixWorld(true); }
+
+          scene.add(obj); nodes.set(inst.occ_id, obj); placed.push(obj);
+        }
+
+        if(placed.length){ fitSceneToObjects(placed); setStatus('Ready'); log(`Units: ${manifest.units||'M'} | instances: ${placed.length} | defs: ${(manifest.parts||[]).length}`); }
+        else { setStatus('No instances'); log('Manifest loaded but instances array is empty or nothing could be loaded.'); }
+      }catch(err){ setStatus('Error'); log(err.message||String(err)); console.error(err); }
+    };
+
+    document.getElementById('fit').onclick = ()=>{
+      const objs=[]; scene.traverse(o=>{ if(o.isMesh) objs.push(o); }); fitSceneToObjects(objs);
+    };
+
+    document.getElementById('debug').onclick = ()=>{
+      const g = new THREE.BoxGeometry(1,1,1); const m = new THREE.MeshStandardMaterial(); const cube = new THREE.Mesh(g,m);
+      cube.position.set(0,0.5,0); scene.add(cube); fitSceneToObjects([cube]); log('Debug cube added.');
+    };
+
+  </script>
+</body>
+</html>

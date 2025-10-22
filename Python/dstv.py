@@ -52,13 +52,15 @@ from pipeline.path_management import (resolve_output_path,
 from pipeline.database import (dump_df_to_supabase, normalize_report_df,
                                 add_to_database
                                 )
+from pipeline.rebuild_exporter import export_handoff_from_existing, export_handoff_from_report
+from pipeline.rebuilder import rebuild_from_handoff
 from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3
 from pathlib import Path
 from pipeline.dupe_report import generate_duplicate_reports, generate_consolidated_report
 from pipeline.geom_alignment import robust_align_length_to_X
 from collections import defaultdict
 
-
+from pipeline.make_ifc import run_ifc_export
 
 def dstv_pipeline(step_file, root_model, project_number, matl_grade):
 
@@ -75,7 +77,7 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
     fallback_root = BASE / "C:/dev/step-gemini/Extraction"
 
     # Project Driven
-    base_path, nc_path, report_path, drilling_path, cad_path, thumb_path, step_path, stl_path, brep_path, dxf_path, dxf_thumb = create_project_directories(step_file, network_root, fallback_root)
+    base_path, nc_path, report_path, drilling_path, cad_path, thumb_path, step_path, stl_path, brep_path, dxf_path, dxf_thumb, handoff_path, handoff_parts, IFC_path = create_project_directories(step_file, network_root, fallback_root)
 
     if not os.path.isfile(root_model):
         raise FileNotFoundError(f"Could not find a STEP file at: {root_model!r}")
@@ -165,6 +167,9 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
 
             # print("=== Original Shape ===")
             # metrics0 = describe_shape(shape_orig)
+
+            # native_step_file = export_solid_to_step(shape_orig, handoff_parts, f"{member_id}_native", glb=True, glb_backend="py", units="MM")
+            native_step_file = export_solid_to_step(shape_orig, handoff_parts, f"{member_id}_native", glb=False)
 
             # STEP 1: Align to major geometry
             primary_aligned_shape, trsf, cs, largest_face, dir_x, dir_y, dir_z, dbg = \
@@ -428,6 +433,7 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
             record_solid(report_rows, 
                      name = member_id,
                      step_path = step_file,
+                     native_step_path=native_step_file,
                      stl_path = stl_file,
                      thumb_path = thumbnail_file,
                      drilling_path = html_file,
@@ -464,6 +470,7 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
             record_solid(report_rows, 
                      name = member_id,
                      step_path = step_file,
+                     native_step_path=native_step_file,
                      stl_path = stl_file,
                      thumb_path = thumbnail_file,
                      drilling_path = html_file,
@@ -536,16 +543,33 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
         project_number=f"{project_number}_coarse",
     )
 
-
-
     # Log to Supabase
     report_for_db = normalize_report_df(report_df, project_number)
     dump_df_to_supabase(report_for_db)
+
+    # Export rebuild manifest
+    pack_dir = export_handoff_from_report(
+        report_df=report_df,
+        out_dir=handoff_path,          # you already get this from create_project_directories
+        prefer_key="auto",             # or "tolerant" if you pass tolerant_sig_rows
+        tolerant_sig_rows=tolerant_sig_rows,  # optional
+        units="MM",
+        schema="AP242",
+    )
+    print("✅ Handoff Pack Created:", pack_dir)
+
+    # Output of rebuilt step file
+    # out_step_path = str(Path(handoff_path) / "rebuilt_assembly.step")
+    # rebuilt = rebuild_from_handoff(handoff_path, out_step_path)
+    # print("✅ Rebuilt STEP:", rebuilt)
 
     print("\n✅ Pipeline completed. Summary saved.")
     finish_time = datetime.now()
     print(f"Finish Time : {finish_time}")
     print(f"Processing Duration : {finish_time - start_time}")
+
+    print("Starting IFC creation")
+    run_ifc_export(handoff_path)
 
 
 
@@ -632,13 +656,13 @@ if __name__ == "__main__":
     step02153b = "118206 - TRAVERSE BEAM 2 FRAME.step"
     step02153c = "118716 - TRAVERSE BEAM 2 FRAME SHORT.step"
 
-    step_files = [step02138]
+    step_files = [step1028]
 
     for step_file in step_files:
         # step_file = step02153b
         step_path = str(Path(home_path).joinpath(step_file))
 
-        project = "10275"
+        project = "9999"
         # project = "test"
         # project = "02086"
         grade = "Mixed"

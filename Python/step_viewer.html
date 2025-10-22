@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>STEP Viewer – Multiselect → Subassembly</title>
+  <style>
+    :root { --bg:#0b0e12; --panel:#12171f; --muted:#98a2b3; --accent:#4f46e5; }
+    html, body { height: 100%; margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background: var(--bg); color: #e5e7eb; }
+    .app { display: grid; grid-template-columns: 320px 1fr; grid-template-rows: 56px 1fr; height: 100%; }
+    header { grid-column: 1 / 3; display:flex; align-items:center; gap:12px; padding: 12px 16px; border-bottom: 1px solid #1f2937; background: #0d1117; }
+    header h1 { font-size: 16px; font-weight: 600; margin: 0; letter-spacing: .2px; }
+    header .meta { font-size: 12px; color: var(--muted); }
+    .sidebar { background: var(--panel); border-right: 1px solid #1f2937; display:flex; flex-direction:column; }
+    .section { padding: 12px; border-bottom: 1px solid #1f2937; }
+    .section h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600; color:#cbd5e1; }
+    .row { display:flex; gap:8px; align-items:center; margin: 6px 0; }
+    label { font-size: 12px; color: var(--muted); }
+    input[type="text"], select { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid #263040; background: #0d1420; color: #e5e7eb; outline: none; }
+    button { padding: 8px 10px; border-radius: 8px; border: 1px solid #2b3445; background: #111827; color: #e5e7eb; cursor: pointer; font-weight: 600; }
+    button.primary { background: var(--accent); border-color: #3b35c6; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .pill { display:inline-flex; align-items:center; gap:6px; padding: 4px 8px; border-radius: 999px; background:#0e1625; border:1px solid #263040; font-size: 12px; }
+    .small { font-size: 11px; color: var(--muted); }
+    .list { max-height: 220px; overflow:auto; display:flex; flex-direction:column; gap:6px; }
+    .chip { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 8px; border-radius:8px; background:#0d1420; border:1px solid #263040; }
+    .chip b { font-weight:600; font-size:12px; }
+    .chip .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#a3b1c6; }
+    .viewer { position: relative; }
+    canvas { display: block; width: 100%; height: 100%; }
+    .hud { position:absolute; top:10px; right:10px; display:flex; gap:8px; }
+    .legend { position:absolute; bottom:10px; left: 10px; display:flex; gap:8px; align-items:center; background:rgba(13,20,32,.8); border:1px solid #263040; padding:8px 10px; border-radius:10px; }
+    .legend .swatch { width:12px; height:12px; border-radius:3px; background:#93c5fd; border:1px solid rgba(255,255,255,.3); }
+    .toast { position:fixed; bottom: 16px; right: 16px; background:#0f172a; color:#e5e7eb; border:1px solid #263040; padding:10px 12px; border-radius:10px; opacity:0; transform: translateY(10px); transition: .3s; }
+    .toast.show { opacity:1; transform: translateY(0); }
+    .divider { height:1px; background:#1f2937; margin:10px -12px; }
+    .tests { font-size:12px; background:#0e1625; border:1px solid #263040; border-radius:8px; padding:8px; margin-top:8px; }
+    .dropzone { position:absolute; inset:0; border:2px dashed #334155; border-radius:12px; display:none; align-items:center; justify-content:center; color:#94a3b8; pointer-events:none; }
+    .dropzone.show { display:flex; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>STEP Viewer – Multiselect → Subassembly</h1>
+      <span class="meta" id="modelMeta">No model loaded</span>
+      <div style="margin-left:auto; display:flex; gap:8px;">
+        <input type="file" id="fileInput" accept=".glb,.gltf" />
+        <button id="btnReset">Reset View</button>
+        <button id="btnRunTests">Run tests</button>
+      </div>
+    </header>
+
+    <aside class="sidebar">
+      <div class="section">
+        <h2>Selection</h2>
+        <div class="row small">Click parts in the 3D view (hold Ctrl or Shift to multi-select). Click again to toggle.</div>
+        <div class="row"><span class="pill">Selected: <span id="selCount">0</span></span></div>
+        <div class="list" id="selList"></div>
+        <div class="divider"></div>
+        <div class="row">
+          <label for="subasmName" style="width:90px;">Subassembly</label>
+          <input id="subasmName" type="text" placeholder="e.g. Frame-01" />
+        </div>
+        <div class="row">
+          <label for="parentSelect" style="width:90px;">Parent</label>
+          <select id="parentSelect"></select>
+        </div>
+        <div class="row">
+          <button id="btnMake" class="primary" disabled>Make Subassembly</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <h2>Properties</h2>
+        <div class="small">Last-picked item</div>
+        <div id="propBox" class="small">—</div>
+      </div>
+
+      <div class="section">
+        <h2>Debug</h2>
+        <button id="btnDump">Dump Selection JSON</button>
+        <div id="testOutput" class="tests" hidden></div>
+      </div>
+    </aside>
+
+    <main class="viewer" id="viewer">
+      <div class="hud">
+        <button id="toggleXray">X-ray</button>
+        <button id="toggleEdges">Edges</button>
+      </div>
+      <div class="legend"><div class="swatch"></div><div class="small">Highlighted = selected</div></div>
+      <div id="dropzone" class="dropzone">Drop .glb/.gltf here</div>
+    </main>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <!-- Three.js (module build) -->
+  <!-- IMPORTANT: Use explicit CDN module paths; do NOT use bare specifiers like "three" in the browser. -->
+  <script type="module">
+    // Explicit, version-pinned ESM imports for the browser:
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+    import { GLTFLoader } from "https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+    import { MeshoptDecoder } from "https://unpkg.com/three@0.160.0/examples/jsm/libs/meshopt_decoder.module.js";
+
+    // ------------------------------------------------------------
+    // 1) Configure your endpoints / files
+    // ------------------------------------------------------------
+    // Expect a glTF/GLB exported from your STEP (server-side OCC), plus a
+    // metadata JSON mapping node UUIDs → { instance_id, part_uid, name, parent_uid }
+    // Example URLs; replace with your paths or enable file upload.
+    const defaultModelURL = null; // e.g., "/models/rebuilt.glb";
+    const defaultMetaURL  = null; // e.g., "/models/rebuilt.meta.json";
+
+    // POST target that performs make_subassembly on the backend
+    // uvicorn should be running pointing at the handoff folder of the assembly
+    // uvicorn settings
+    //      set HANDOFF_DIR=G:\path\to\your\handoff   # or export on mac/linux
+    //      set OUTPUT_BASENAME=rebuilt               # optional
+    //      uvicorn server.main:app --reload --port 5055
+
+    const MAKE_SUBASM_URL = "http://localhost:5055/api/make_subassembly";
+
+    // ------------------------------------------------------------
+    // 2) Basic Viewer scaffolding
+    // ------------------------------------------------------------
+    const container = document.getElementById('viewer');
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0e12);
+
+    const camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.1, 5000);
+    camera.position.set(300, 220, 300);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    // Lights
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x223344, 0.8);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6); dir.position.set(200, 300, 200); scene.add(dir);
+
+    // Helpers
+    const grid = new THREE.GridHelper(2000, 40, 0x334155, 0x1f2937); grid.position.y = -0.001; scene.add(grid);
+
+    // Raycaster for picking
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    // State
+    const selected = new Set(); // of object.uuid (mesh UUID)
+    const metaByUUID = new Map(); // uuid -> metadata
+    const parents = new Set();    // parent_uid candidates
+
+    // UI elements
+    const selListEl = document.getElementById('selList');
+    const selCountEl = document.getElementById('selCount');
+    const propBoxEl = document.getElementById('propBox');
+    const parentSelectEl = document.getElementById('parentSelect');
+    const subasmNameEl = document.getElementById('subasmName');
+    const btnMake = document.getElementById('btnMake');
+    const modelMetaEl = document.getElementById('modelMeta');
+    const testOutputEl = document.getElementById('testOutput');
+
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg; t.classList.add('show');
+      setTimeout(()=> t.classList.remove('show'), 2500);
+    }
+
+    // Material helpers
+    const baseMat = new THREE.MeshStandardMaterial({ metalness: 0.2, roughness: 0.6, color: 0x6b7280 });
+    const selMat  = new THREE.MeshStandardMaterial({ metalness: 0.2, roughness: 0.4, color: 0x93c5fd, emissive: 0x0, envMapIntensity: 0.5 });
+    const xrayMat = new THREE.MeshStandardMaterial({ color: 0x6b7280, metalness: 0.1, roughness: 0.9, opacity: 0.15, transparent: true, depthWrite: false });
+
+    let xray = false;
+
+    function applyMaterialRecursive(obj, mat) {
+      if (!obj) return;
+      obj.traverse(o => { if (o.isMesh) { o.material = mat; o.castShadow = false; o.receiveShadow = true; o.userData.__baseMaterial = o.userData.__baseMaterial || baseMat; }});
+    }
+
+    function setSelected(obj, isSel) {
+      if (!obj) return;
+      obj.traverse(o => {
+        if (o.isMesh) {
+          if (isSel) {
+            o.userData.__prevMat = o.material; o.material = selMat;
+          } else {
+            o.material = o.userData.__baseMaterial || baseMat;
+          }
+        }
+      });
+    }
+
+    // Loaders
+    const gltfLoader = new GLTFLoader(); gltfLoader.setMeshoptDecoder(MeshoptDecoder);
+
+    let modelRoot = null;
+
+    async function loadModelAndMeta(modelURL, metaURL) {
+      // Clear previous
+      if (modelRoot) { scene.remove(modelRoot); modelRoot.traverse(o => o.geometry?.dispose()); modelRoot = null; }
+      selected.clear(); metaByUUID.clear(); parents.clear(); parentSelectEl.innerHTML = '';
+
+      const gltf = await gltfLoader.loadAsync(modelURL);
+      modelRoot = gltf.scene; scene.add(modelRoot);
+
+      // Fit camera
+      const box = new THREE.Box3().setFromObject(modelRoot);
+      const size = new THREE.Vector3(); box.getSize(size);
+      const center = new THREE.Vector3(); box.getCenter(center);
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const fov = camera.fov * (Math.PI / 180);
+      let camZ = Math.abs(maxDim / Math.tan(fov / 2)); camZ *= 1.4;
+      camera.position.set(center.x + camZ, center.y + camZ * 0.6, center.z + camZ);
+      camera.near = Math.max(0.01, maxDim / 1000); camera.far = Math.max(1000, maxDim * 10); camera.updateProjectionMatrix();
+      controls.target.copy(center); controls.update();
+
+      // Base materials
+      applyMaterialRecursive(modelRoot, baseMat);
+
+      // Load metadata
+      if (metaURL) {
+        try {
+          const meta = await (await fetch(metaURL)).json();
+          // Expect meta: { nodes: { [uuid]: { instance_id, part_uid, name, parent_uid } }, parents: ["__ROOT__", ...] }
+          const nodes = meta.nodes || {};
+          Object.keys(nodes).forEach(uuid => metaByUUID.set(uuid, nodes[uuid]));
+          (meta.parents || ["__ROOT__"]).forEach(p => parents.add(p));
+          modelMetaEl.textContent = meta.model_name ? `Model: ${meta.model_name}` : 'Model loaded';
+        } catch (e) {
+          console.warn('No metadata found or parse failed. Falling back.', e);
+          fallbackMetaFromGLTF();
+        }
+      } else {
+        // Fallback: build minimal metadata from glTF nodes
+        fallbackMetaFromGLTF();
+      }
+
+      refreshParentDropdown();
+    }
+
+    function fallbackMetaFromGLTF(){
+      if (!modelRoot) return;
+      modelRoot.traverse(o => { if (o.isMesh) { metaByUUID.set(o.uuid, { instance_id: o.name || o.uuid, part_uid: null, name: o.name || o.uuid, parent_uid: "__ROOT__" }); parents.add("__ROOT__"); }});
+      modelMetaEl.textContent = 'Model (no metadata)';
+    }
+
+    function refreshParentDropdown() {
+      parentSelectEl.innerHTML = '';
+      ;[...parents].sort().forEach(p => {
+        const opt = document.createElement('option'); opt.value = p; opt.textContent = p; parentSelectEl.appendChild(opt);
+      });
+    }
+
+    function onResize() {
+      const w = container.clientWidth, h = container.clientHeight;
+      camera.aspect = w / h; camera.updateProjectionMatrix(); renderer.setSize(w, h);
+    }
+    window.addEventListener('resize', onResize);
+
+    function screenPick(event) {
+      if (!modelRoot) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      const x = ( (event.clientX - rect.left) / rect.width ) * 2 - 1;
+      const y = - ( (event.clientY - rect.top) / rect.height ) * 2 + 1;
+      mouse.set(x, y);
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObject(modelRoot, true);
+      if (intersects.length) {
+        const obj = intersects[0].object;
+        const uuid = obj.uuid;
+        const meta = metaByUUID.get(uuid) || { instance_id: uuid, name: obj.name };
+        const additive = event.ctrlKey || event.shiftKey || event.metaKey;
+        const already = selected.has(uuid);
+        if (!additive) { // clear if not additive
+          [...selected].forEach(id => setSelected(findByUUID(id), false));
+          selected.clear();
+        }
+        if (already) {
+          selected.delete(uuid); setSelected(obj, false);
+        } else {
+          selected.add(uuid); setSelected(obj, true);
+        }
+        updateSelectionUI(meta);
+      }
+    }
+
+    function findByUUID(uuid) {
+      let found = null; if (!modelRoot) return found; modelRoot.traverse(o => { if (o.uuid === uuid) found = o; }); return found;
+    }
+
+    function updateSelectionUI(lastMeta=null) {
+      selCountEl.textContent = String(selected.size);
+      selListEl.innerHTML = '';
+      [...selected].forEach(uuid => {
+        const m = metaByUUID.get(uuid) || { instance_id: uuid, name: uuid };
+        const el = document.createElement('div'); el.className = 'chip';
+        el.innerHTML = `<div><b>${(m.name||'')}</b><div class="id">${m.instance_id}</div></div>`;
+        const rm = document.createElement('button'); rm.textContent = '×'; rm.title = 'Remove';
+        rm.onclick = () => { selected.delete(uuid); setSelected(findByUUID(uuid), false); updateSelectionUI(); };
+        el.appendChild(rm); selListEl.appendChild(el);
+      });
+      btnMake.disabled = selected.size < 2 || !subasmNameEl.value.trim();
+      if (lastMeta) {
+        propBoxEl.innerHTML = `
+          <div><b>Name:</b> ${lastMeta.name||'—'}</div>
+          <div><b>Instance:</b> <span class="id">${lastMeta.instance_id||'—'}</span></div>
+          <div><b>Part UID:</b> <span class="id">${lastMeta.part_uid||'—'}</span></div>
+          <div><b>Parent UID:</b> <span class="id">${lastMeta.parent_uid||'__ROOT__'}</span></div>
+        `;
+      }
+    }
+
+    // Edge overlay (optional)
+    let showEdges = false; let edgesGroup = new THREE.Group(); scene.add(edgesGroup);
+    function rebuildEdges() {
+      edgesGroup.clear();
+      if (!showEdges || !modelRoot) return;
+      const mat = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.25 });
+      modelRoot.traverse(o => {
+        if (o.isMesh) {
+          const eg = new THREE.EdgesGeometry(o.geometry, 20);
+          const lines = new THREE.LineSegments(eg, mat); lines.position.copy(o.getWorldPosition(new THREE.Vector3()));
+          lines.quaternion.copy(o.getWorldQuaternion(new THREE.Quaternion()));
+          lines.scale.copy(o.getWorldScale(new THREE.Vector3()));
+          edgesGroup.add(lines);
+        }
+      });
+    }
+
+    // Listeners
+    renderer.domElement.addEventListener('pointerdown', screenPick);
+
+    document.getElementById('toggleXray').addEventListener('click', () => {
+      xray = !xray; applyMaterialRecursive(modelRoot, xray ? xrayMat : baseMat);
+      // reapply selected highlight
+      [...selected].forEach(uuid => { const o=findByUUID(uuid); if (o) setSelected(o, true); });
+    });
+
+    document.getElementById('toggleEdges').addEventListener('click', () => {
+      showEdges = !showEdges; rebuildEdges();
+    });
+
+    document.getElementById('btnReset').addEventListener('click', () => {
+      if (!modelRoot) return; const box = new THREE.Box3().setFromObject(modelRoot);
+      const size = new THREE.Vector3(); box.getSize(size); const center = new THREE.Vector3(); box.getCenter(center);
+      const maxDim = Math.max(size.x, size.y, size.z); const fov = camera.fov * Math.PI/180; let camZ = Math.abs(maxDim/Math.tan(fov/2))*1.4;
+      camera.position.set(center.x + camZ, center.y + camZ * 0.6, center.z + camZ); controls.target.copy(center); controls.update();
+    });
+
+    document.getElementById('btnDump').addEventListener('click', () => {
+      const payload = selectionPayload();
+      console.log('Selection payload', payload);
+      navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+      showToast('Selection JSON copied to clipboard');
+    });
+
+    subasmNameEl.addEventListener('input', () => { btnMake.disabled = selected.size < 2 || !subasmNameEl.value.trim(); });
+
+    document.getElementById('btnMake').addEventListener('click', async () => {
+      const payload = selectionPayload();
+      if (payload.selection.length < 2) return;
+      try {
+        const res = await fetch(MAKE_SUBASM_URL, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        showToast(data.message || 'Subassembly created');
+      } catch (err) {
+        console.error(err); showToast('Failed to create subassembly');
+      }
+    });
+
+    function selectionPayload() {
+      const sel = [...selected].map(uuid => metaByUUID.get(uuid)?.instance_id || uuid);
+      return {
+        selection: sel,
+        subasm_name: subasmNameEl.value.trim() || 'Subassembly',
+        parent_uid: parentSelectEl.value || '__ROOT__',
+      };
+    }
+
+    // File input (optional local load)
+    const fileInput = document.getElementById('fileInput');
+    fileInput.addEventListener('change', async (e) => {
+      const file = e.target.files?.[0]; if (!file) return;
+      const url = URL.createObjectURL(file);
+      await loadModelAndMeta(url, null); // no meta for local file
+    });
+
+    // Drag & drop support
+    const dropzone = document.getElementById('dropzone');
+    ['dragenter','dragover'].forEach(ev => container.addEventListener(ev, e => { e.preventDefault(); dropzone.classList.add('show'); }));
+    ;['dragleave','drop'].forEach(ev => container.addEventListener(ev, e => { e.preventDefault(); dropzone.classList.remove('show'); }));
+    container.addEventListener('drop', async (e) => {
+      const file = e.dataTransfer?.files?.[0]; if (!file) return;
+      const url = URL.createObjectURL(file);
+      await loadModelAndMeta(url, null);
+    });
+
+    // Animation loop
+    function animate(){ requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); }
+    animate();
+
+    // Auto-load defaults if provided
+    if (defaultModelURL) loadModelAndMeta(defaultModelURL, defaultMetaURL).catch(console.error);
+
+    // ------------------------------------------------------------
+    // 3) Tiny test harness ("ALWAYS add more test cases")
+    // ------------------------------------------------------------
+    const tests = [];
+
+    tests.push({
+      name: 'Modules load (THREE, OrbitControls, GLTFLoader, MeshoptDecoder)',
+      run: () => !!THREE && !!OrbitControls && !!GLTFLoader && !!MeshoptDecoder
+    });
+
+    tests.push({
+      name: 'Selection payload disabled with <2 items and empty name',
+      run: () => {
+        selected.clear(); subasmNameEl.value = '';
+        const payload = selectionPayload();
+        const disabled = (selected.size < 2 || !subasmNameEl.value.trim());
+        return disabled && payload.selection.length === 0 && payload.subasm_name === 'Subassembly';
+      }
+    });
+
+    tests.push({
+      name: 'Parent dropdown populates with fallback __ROOT__',
+      run: () => {
+        parents.clear(); fallbackMetaFromGLTF = () => { parents.add('__ROOT__'); };
+        fallbackMetaFromGLTF(); refreshParentDropdown();
+        return parentSelectEl.options.length >= 1 && parentSelectEl.options[0].value === '__ROOT__';
+      }
+    });
+
+    document.getElementById('btnRunTests').addEventListener('click', () => {
+      const results = tests.map(t => ({ name: t.name, ok: !!t.run() }));
+      const allOK = results.every(r => r.ok);
+      testOutputEl.hidden = false;
+      testOutputEl.innerHTML = `<b>Test results:</b><br/>` + results.map(r => `${r.ok ? '✅' : '❌'} ${r.name}`).join('<br/>');
+      showToast(allOK ? 'All tests passed' : 'Some tests failed');
+      console.table(results);
+    });
+  </script>
+</body>
+</html>

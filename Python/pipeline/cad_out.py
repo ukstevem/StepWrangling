@@ -28,6 +28,77 @@ from OCC.Core.gp import gp_Ax3, gp_Pnt, gp_Dir
 from OCC.Core.StlAPI import StlAPI_Writer
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib
+from importlib import reload
+
+# --- GLB export + XCAF (pythonocc) ---
+try:
+    from OCC.Core.RWGltf import RWGltf_CafWriter
+    from OCC.Core.TCollection import TCollection_AsciiString, TCollection_ExtendedString
+    from OCC.Core.TColStd import TColStd_IndexedDataMapOfStringString, TColStd_MapOfAsciiString
+    from OCC.Core.XCAFApp import XCAFApp_Application
+    from OCC.Core.TDocStd import TDocStd_Document
+    from OCC.Core.XCAFDoc import XCAFDoc_DocumentTool
+    from OCC.Core.TDataStd import TDataStd_Name
+    from OCC.Core.TDF import TDF_LabelSequence
+    _HAS_RWGltf = True
+except Exception:
+    _HAS_RWGltf = False
+
+## --- pygltflib (pure-Python GLB path) with broad version-compat ---
+import sys, importlib
+_HAS_PYGLTFLIB = False
+
+try:
+    m = importlib.import_module("pygltflib")
+
+    # Always-present core classes across versions
+    from pygltflib import GLTF2, Scene, Node, Mesh, Primitive, Buffer, BufferView, Accessor, Asset
+
+    # Optional helpers that may be missing on older/newer builds
+    try:
+        # Modern builds expose an Attributes helper; older ones don’t.
+        from pygltflib import Attributes as _GLTF_Attributes
+        def _attrs(**kw): return _GLTF_Attributes(**kw)
+    except Exception:
+        def _attrs(**kw): return kw
+
+    # Enums / constants may be missing; provide raw glTF values as fallback.
+    try:
+        from pygltflib import AccessorType, ComponentType
+        _TYPE_VEC3   = getattr(AccessorType, "VEC3", "VEC3")
+        _TYPE_SCALAR = getattr(AccessorType, "SCALAR", "SCALAR")
+        _CT_FLOAT    = getattr(ComponentType, "FLOAT", 5126)
+        _CT_UINT     = getattr(ComponentType, "UNSIGNED_INT", 5125)
+    except Exception:
+        _TYPE_VEC3, _TYPE_SCALAR = "VEC3", "SCALAR"
+        _CT_FLOAT, _CT_UINT      = 5126, 5125
+
+    # ARRAY_BUFFER / ELEMENT_ARRAY_BUFFER
+    try:
+        from pygltflib import ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER
+        _BUF_ARRAY, _BUF_ELEM = ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER
+    except Exception:
+        _BUF_ARRAY, _BUF_ELEM = 34962, 34963
+
+    # BinaryData wrapper may not exist; we’ll handle both.
+    try:
+        from pygltflib import BinaryData as _BinaryData
+    except Exception:
+        _BinaryData = None
+
+    print("[cad_out] pygltflib OK:",
+          getattr(m, "__version__", "?"),
+          "→", getattr(m, "__file__", "?"),
+          "| python:", sys.executable)
+    _HAS_PYGLTFLIB = True
+
+except Exception as e:
+    print("[cad_out] pygltflib import FAILED →", repr(e),
+          "| python:", sys.executable,
+          "\n[cad_out] sys.path[0:3] =", sys.path[:3])
+    _HAS_PYGLTFLIB = False
+
+
 
 # Optional: DXF rendering helper (qsave may not exist)
 try:
@@ -88,18 +159,510 @@ def _wire_to_circle_uv(face, wire, project_uv, tol_r=1e-5, tol_ang=1e-3):
     return (cu, cv, r)
 
 
-# -------------------------
-# STEP export
-# -------------------------
-def export_solid_to_step(solid, out_dir, filename):
+# ---------- GLB helpers ----------
+
+def _write_glb_for_single_shape(solid, out_dir: Path, filename: str, *, units="MM"):
+    try:
+        if not _HAS_RWGltf:
+            print("[cad_out] GLB skipped: RWGltf not available in this OCCT build.")
+            return None
+
+        app = XCAFApp_Application.GetApplication()
+        try:
+            doc = TDocStd_Document("MDTV-XCAF")
+        except Exception:
+            doc = TDocStd_Document(TCollection_ExtendedString("MDTV-XCAF"))
+        try:
+            app.NewDocument("MDTV-XCAF", doc)
+        except Exception:
+            print("glb failed on setting doc")
+            pass
+
+        try:
+            st = XCAFDoc_DocumentTool.ShapeTool(doc.Main())
+        except AttributeError:
+            st = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
+        try:
+            lbl = st.AddShape(solid)
+        except TypeError:
+            lbl = st.NewShape(); st.SetShape(lbl, solid)
+        try:
+            TDataStd_Name.Set(lbl, TCollection_ExtendedString(filename))
+        except Exception:
+            print("glb failed on setting label")
+            pass
+
+        # Triangulate
+        bb = Bnd_Box(); brepbndlib.Add(solid, bb, True)
+        xmin,ymin,zmin,xmax,ymax,zmax = bb.Get()
+        diag = max(((xmax-xmin)**2 + (ymax-ymin)**2 + (zmax-zmin)**2) ** 0.5, 1e-6)
+        if str(units).upper().startswith("M") and len(str(units)) == 1:
+            min_defl, max_defl = 0.0005, 0.01
+        else:
+            min_defl, max_defl = 0.5, 10.0
+        lin_defl = max(min_defl, min(max_defl, diag / 200.0))
+        BRepMesh_IncrementalMesh(solid, lin_defl, False, 0.1, True)
+        print("cad_out Triangulation")
+
+        # Write GLB
+        print("cad_out glb out start")
+        glb_path = Path(out_dir) / f"{filename}.glb"
+        glb_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build AsciiString robustly, avoiding any shadowed names
+        ascii_path = None
+        try:
+            # Prefer module-qualified import to dodge shadowing
+            from OCC.Core import TCollection as _TCol
+            ascii_path = _TCol.TCollection_AsciiString(glb_path.as_posix())
+        except Exception as e:
+            print("cad_out: module-qualified TCollection_AsciiString failed:", repr(e))
+            try:
+                # Try the symbol if it wasn't shadowed
+                ascii_path = TCollection_AsciiString(glb_path.as_posix())
+            except Exception as e2:
+                print("cad_out: direct TCollection_AsciiString failed:", repr(e2))
+                try:
+                    # Some bindings accept bytes
+                    ascii_path = TCollection_AsciiString(glb_path.as_posix().encode("utf-8"))
+                except Exception as e3:
+                    print("cad_out: bytes TCollection_AsciiString failed:", repr(e3))
+                    # Final fallback: bail out of GLB politely (do not raise)
+                    print("[cad_out] GLB skipped: could not construct TCollection_AsciiString")
+                    return None
+
+        print("cad_out ascii_path built ok")
+
+        # Create writer using module-qualified class to avoid shadowing too
+        try:
+            from OCC.Core import RWGltf as _RW
+            writer = _RW.RWGltf_CafWriter(ascii_path, True)  # True => .glb
+        except Exception as e:
+            print("cad_out: RWGltf_CafWriter (module-qualified) failed:", repr(e))
+            try:
+                writer = RWGltf_CafWriter(ascii_path, True)
+            except Exception as e2:
+                print("cad_out: RWGltf_CafWriter (direct) failed:", repr(e2))
+                print("[cad_out] GLB skipped: RWGltf_CafWriter ctor failed")
+                return None
+
+        fileInfo = TColStd_IndexedDataMapOfStringString()
+        progress = Message_ProgressRange()
+
+        # Try multiple Perform overloads
+        ok = False
+        last_err = None
+
+        try:
+            print("cad_out: trying Perform(doc, fileInfo, progress)")
+            ok = bool(writer.Perform(doc, fileInfo, progress))
+            print("cad_out: overload #1 ->", ok)
+        except Exception as e:
+            last_err = e
+            print("cad_out: overload #1 failed:", repr(e))
+            ok = False
+
+        # roots/filter setup
+        try:
+            roots = TDF_LabelSequence()
+            st.GetFreeShapes(roots)
+        except Exception:
+            roots = TDF_LabelSequence()
+        labelFilter = TColStd_MapOfAsciiString()
+
+        if not ok:
+            try:
+                print("cad_out: trying Perform(doc, roots, labelFilter, fileInfo, progress)")
+                ok = bool(writer.Perform(doc, roots, labelFilter, fileInfo, progress))
+                print("cad_out: overload #2 ->", ok)
+            except Exception as e:
+                last_err = e
+                print("cad_out: overload #2 failed:", repr(e))
+                ok = False
+
+        if not ok:
+            try:
+                print("cad_out: trying Perform(doc, fileInfo) [no progress]")
+                ok = bool(writer.Perform(doc, fileInfo))
+                print("cad_out: overload #3 ->", ok)
+            except Exception as e:
+                last_err = e
+                print("cad_out: overload #3 failed:", repr(e))
+                ok = False
+
+        if not ok:
+            try:
+                print("cad_out: trying Perform(doc, roots, labelFilter, fileInfo) [no progress]")
+                ok = bool(writer.Perform(doc, roots, labelFilter, fileInfo))
+                print("cad_out: overload #4 ->", ok)
+            except Exception as e:
+                last_err = e
+                print("cad_out: overload #4 failed:", repr(e))
+                ok = False
+
+        # Write() if present
+        if hasattr(writer, "Write"):
+            try:
+                writer.Write()
+            except Exception as e:
+                print("cad_out: writer.Write() threw (ignored):", repr(e))
+
+        if not ok:
+            print(f"[cad_out] GLB writer returned False for {filename}")
+            if last_err:
+                print(f"[cad_out] last Perform() error: {repr(last_err)}")
+            return None
+
+        print(f"[cad_out] wrote GLB → {glb_path}")
+        return glb_path
+
+
+    except Exception as e:
+        print(f"[cad_out] warn: GLB export failed for {filename}: {e}")
+        return None
+
+
+def _new_xcaf_doc():
+    app = XCAFApp_Application.GetApplication()
+    try:
+        doc = TDocStd_Document("MDTV-XCAF")
+    except Exception:
+        doc = TDocStd_Document(TCollection_ExtendedString("MDTV-XCAF"))
+    try:
+        app.NewDocument("MDTV-XCAF", doc)
+    except Exception:
+        try:
+            app.NewDocument(TCollection_ExtendedString("MDTV-XCAF"), doc)
+        except Exception:
+            pass
+    return doc
+
+def _shape_tool(doc):
+    # handle both static variants
+    try:
+        return XCAFDoc_DocumentTool.ShapeTool(doc.Main())
+    except AttributeError:
+        return XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
+
+def _set_occ_name(label, name: str):
+    if not name:
+        return
+    try:
+        TDataStd_Name.Set(label, TCollection_ExtendedString(name))
+    except Exception:
+        pass
+
+def _bbox_diag(shape):
+    bb = Bnd_Box(); brepbndlib.Add(shape, bb, True)
+    xmin, ymin, zmin, xmax, ymax, zmax = bb.Get()
+    dx, dy, dz = (xmax-xmin), (ymax-ymin), (zmax-zmin)
+    return float((dx*dx + dy*dy + dz*dz) ** 0.5)
+
+def _triangulate_for_glb(shape, units="MM"):
+    diag = max(_bbox_diag(shape), 1e-6)
+    if str(units).upper().startswith("M") and len(str(units)) == 1:  # meters
+        min_defl, max_defl = 0.0005, 0.01   # 0.5–10 mm
+    else:                                    # millimeters
+        min_defl, max_defl = 0.5, 10.0
+    lin_defl = max(min_defl, min(max_defl, diag / 200.0))
+    ang_defl = 0.1
+    # absolute deflection (relative=False), multi-thread (parallel=True)
+    BRepMesh_IncrementalMesh(shape, lin_defl, False, ang_defl, True)
+
+def _write_glb_from_doc(doc, out_glb: Path) -> bool:
+    out_glb.parent.mkdir(parents=True, exist_ok=True)
+    fname = TCollection_AsciiString(str(out_glb).replace("\\", "/"))
+    writer = RWGltf_CafWriter(fname, True)  # True => .glb
+    fileInfo = TColStd_IndexedDataMapOfStringString()
+    progress = Message_ProgressRange()
+    # Try simple overload first
+    try:
+        ok = bool(writer.Perform(doc, fileInfo, progress))
+    except TypeError:
+        ok = False
+    if not ok:
+        # Fallback overload with root labels
+        roots = TDF_LabelSequence()
+        st = _shape_tool(doc)
+        try:
+            st.GetFreeShapes(roots)
+        except Exception:
+            pass
+        labelFilter = TColStd_MapOfAsciiString()
+        ok = bool(writer.Perform(doc, roots, labelFilter, fileInfo, progress))
+    if hasattr(writer, "Write"):
+        try:
+            writer.Write()
+        except Exception:
+            pass
+    if not ok:
+        print("[cad_out] GLB writer returned False")
+        return False
+    print(f"[cad_out] wrote GLB → {out_glb}")
+    return True
+
+import numpy as np
+
+def _compute_vertex_normals(V: np.ndarray, I: np.ndarray) -> np.ndarray:
     """
-    Write `solid` to out_dir/filename.step using the 4-arg Transfer.
+    Per-vertex area-weighted normals from triangle list.
+    V: (N,3) float32, I: (T,3) uint32
+    Returns N: (N,3) float32 with unit normals.
+    """
+    N = np.zeros_like(V, dtype=np.float32)
+    p0 = V[I[:,0]]
+    p1 = V[I[:,1]]
+    p2 = V[I[:,2]]
+    # face normals (area-weighted)
+    fn = np.cross(p1 - p0, p2 - p0)
+    # accumulate to vertices
+    np.add.at(N, I[:,0], fn)
+    np.add.at(N, I[:,1], fn)
+    np.add.at(N, I[:,2], fn)
+    # normalize
+    lens = np.linalg.norm(N, axis=1)
+    lens[lens == 0] = 1.0
+    N /= lens[:, None].astype(np.float32)
+    return N.astype(np.float32)
+
+
+def _dedupe_vertices(V: np.ndarray, I: np.ndarray, tol: float = 1e-6):
+    """
+    Merge nearly-identical vertices (within 'tol') and remap indices.
+    Returns: V2, I2
+    """
+    # quantize to grid to make hashing robust
+    q = (V / tol).round().astype(np.int64)
+    # build unique rows
+    # use a view that makes rows hashable
+    q_view = q.view([('x', q.dtype), ('y', q.dtype), ('z', q.dtype)]).reshape(-1)
+    uniq, inv = np.unique(q_view, return_inverse=True)
+    V2 = V[np.sort(np.unique(inv))]
+    # map old vertex idx -> new
+    I2 = inv[I]
+    return V2.astype(np.float32), I2.astype(np.uint32)
+
+
+def export_solid_to_glb(solid, out_dir, filename, *, units="MM"):
+    """
+    Write `solid` to out_dir/filename.glb by creating a tiny XCAF doc,
+    registering the shape, triangulating it, and calling RWGltf_CafWriter.
+    """
+    if solid is None:
+        raise ValueError("export_solid_to_glb: got None instead of a TopoDS_Shape")
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    glb_path = out_dir / f"{filename}.glb"
+
+    # Minimal XCAF doc with a single free-shape definition
+    doc = _new_xcaf_doc()
+    st = _shape_tool(doc)
+    try:
+        lbl = st.AddShape(solid)
+    except TypeError:
+        lbl = st.NewShape(); st.SetShape(lbl, solid)
+    _set_occ_name(lbl, filename)
+
+    # Ensure triangulation exists on faces
+    _triangulate_for_glb(solid, units=units)
+
+    _write_glb_from_doc(doc, glb_path)
+    return glb_path
+
+
+def _triangulation_arrays_from_shape(shape):
+    """
+    Extracts (vertices Nx3 float32, indices Mx3 uint32) from OCC face triangulations.
+    Returns (V, I). If no triangles, returns (None, None).
+    """
+    verts = []
+    faces = []
+    base = 0
+
+    topo = TopologyExplorer(shape)
+    for face in topo.faces():
+        tri = BRep_Tool.Triangulation(face, face.Location())
+        if not tri:
+            continue
+
+        # collect nodes
+        for i in range(1, tri.NbNodes() + 1):
+            p = tri.Node(i)
+            verts.append((float(p.X()), float(p.Y()), float(p.Z())))
+        # collect triangles (1-based indices)
+        for i in range(1, tri.NbTriangles() + 1):
+            t = tri.Triangle(i)
+            n1, n2, n3 = t.Get()
+            faces.append((base + n1 - 1, base + n2 - 1, base + n3 - 1))
+
+        base += tri.NbNodes()
+
+    if not verts or not faces:
+        return None, None
+
+    import numpy as np
+    V = np.asarray(verts, dtype=np.float32)
+    I = np.asarray(faces, dtype=np.uint32).reshape(-1, 3)
+    return V, I
+
+
+def _export_glb_py_from_shape(shape, out_dir: Path, filename: str) -> Path | None:
+    """
+    Pure-Python GLB (no RWGltf). Version-agnostic for pygltflib:
+    - avoids importing enums (uses spec literals)
+    - falls back if set_binary_blob signature differs
+    Writes POSITION + NORMAL + indices, with vertex dedupe.
+    """
+    if not _HAS_PYGLTFLIB:
+        print("[cad_out] GLB(py) skipped: pygltflib not installed")
+        return None
+
+    # Only import the classes that exist across versions
+    try:
+        from pygltflib import GLTF2, Asset, Buffer, BufferView, Accessor, Mesh, Node, Scene, Primitive
+    except Exception as e:
+        print(f"[cad_out] pygltflib import FAILED (core types): {e}")
+        return None
+
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    glb_path = out_dir / f"{filename}.glb"
+
+    # Triangulation arrays
+    V, I = _triangulation_arrays_from_shape(shape)
+    if V is None or I is None:
+        print("[cad_out] GLB(py) no triangles on shape; skipped")
+        return None
+
+    # Dedupe + normals
+    V, I = _dedupe_vertices(V, I, tol=1e-6)
+    N = _compute_vertex_normals(V, I)
+
+    # Pack buffers: positions | normals | indices
+    pos_bytes = V.tobytes(order="C")                      # float32*3
+    nrm_bytes = N.tobytes(order="C")                      # float32*3
+    idx_bytes = I.astype(np.uint32, copy=False).tobytes() # uint32*3
+
+    def _pad4(b: bytes) -> bytes:
+        return b + (b"\x00" * ((-len(b)) & 3))
+
+    pos_bytes = _pad4(pos_bytes)
+    nrm_bytes = _pad4(nrm_bytes)
+    idx_bytes = _pad4(idx_bytes)
+    blob = pos_bytes + nrm_bytes + idx_bytes
+
+    # ---- glTF spec literals (avoid enums for max compatibility) ----
+    # BufferView.target
+    ARRAY_BUFFER         = 34962
+    ELEMENT_ARRAY_BUFFER = 34963
+    # Accessor.componentType
+    FLOAT        = 5126
+    UNSIGNED_INT = 5125
+    # Accessor.type
+    T_VEC3   = "VEC3"
+    T_SCALAR = "SCALAR"
+
+    buf = Buffer(byteLength=len(blob))
+
+    bv_positions = BufferView(
+        buffer=0,
+        byteOffset=0,
+        byteLength=len(pos_bytes),
+        target=ARRAY_BUFFER
+    )
+    bv_normals = BufferView(
+        buffer=0,
+        byteOffset=len(pos_bytes),
+        byteLength=len(nrm_bytes),
+        target=ARRAY_BUFFER
+    )
+    bv_indices = BufferView(
+        buffer=0,
+        byteOffset=len(pos_bytes) + len(nrm_bytes),
+        byteLength=len(idx_bytes),
+        target=ELEMENT_ARRAY_BUFFER
+    )
+
+    mins = V.min(axis=0).astype(float).tolist()
+    maxs = V.max(axis=0).astype(float).tolist()
+
+    acc_positions = Accessor(
+        bufferView=0,
+        byteOffset=0,
+        componentType=FLOAT,
+        count=V.shape[0],
+        type=T_VEC3,
+        min=mins,
+        max=maxs
+    )
+    acc_normals = Accessor(
+        bufferView=1,
+        byteOffset=0,
+        componentType=FLOAT,
+        count=N.shape[0],
+        type=T_VEC3
+    )
+    acc_indices = Accessor(
+        bufferView=2,
+        byteOffset=0,
+        componentType=UNSIGNED_INT,
+        count=I.size,   # number of scalars
+        type=T_SCALAR
+    )
+
+    prim = Primitive(
+        attributes={"POSITION": 0, "NORMAL": 1},
+        indices=2
+    )
+    mesh  = Mesh(primitives=[prim])
+    node  = Node(mesh=0, name=filename)
+    scene = Scene(nodes=[0])
+
+    gltf = GLTF2(
+        asset=Asset(version="2.0"),
+        buffers=[buf],
+        bufferViews=[bv_positions, bv_normals, bv_indices],
+        accessors=[acc_positions, acc_normals, acc_indices],
+        meshes=[mesh],
+        nodes=[node],
+        scenes=[scene],
+        scene=0
+    )
+
+    # set the binary blob in a way that works across pygltflib versions
+    try:
+        gltf.set_binary_blob(blob)            # new-style
+    except TypeError:
+        try:
+            from pygltflib import BinaryData  # old-style
+            gltf.set_binary_blob(BinaryData(blob))
+        except Exception as e:
+            print(f"[cad_out] GLB(py) failed to attach binary: {e}")
+            return None
+
+    try:
+        gltf.save_binary(str(glb_path))
+        print(f"[cad_out] wrote GLB(py) → {glb_path}")
+        return glb_path
+    except Exception as e:
+        print(f"[cad_out] GLB(py) save failed: {e}")
+        return None
+
+
+# -------------------------
+# STEP export  (+ optional GLB)
+# -------------------------
+
+def export_solid_to_step(solid, out_dir, filename, *, glb: bool = False, units: str = "MM", glb_backend: str = "py"):
+    """
+    Write `solid` to out_dir/filename.step.
+    If glb=True, also writes out_dir/filename.glb using selected backend:
+      - glb_backend="py"   → safe pure-Python (pygltflib)
+      - glb_backend="auto" → try RWGltf then fallback to Python
+      - glb_backend="off"  → skip
     """
     if solid is None:
         raise ValueError("export_solid_to_step: got None instead of a TopoDS_Shape")
 
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     step_path = out_dir / f"{filename}.step"
 
     writer = STEPControl_Writer()
@@ -107,12 +670,33 @@ def export_solid_to_step(solid, out_dir, filename):
     ok = writer.Transfer(solid, STEPControl_AsIs, True, prog)
     if ok != 1:
         raise RuntimeError(f"❌ STEP transfer failed for {filename!r} (status={ok})")
-
     status = writer.Write(str(step_path))
     if status != IFSelect_RetDone:
         raise RuntimeError(f"❌ STEP write failed for {filename!r} (status={status})")
-
     print(f"✅ STEP saved to {step_path!r}")
+
+    if glb and glb_backend != "off":
+        # ensure triangulation exists (cheap if already meshed)
+        try:
+            _triangulate_for_glb(solid, units=units)
+        except Exception as e:
+            print(f"[cad_out] warn: pre-mesh for GLB failed ({e}); continuing")
+
+        wrote = None
+        if glb_backend in ("auto", "rwgltf"):
+            # ⚠️ On your build, RWGltf ctor seems to hard crash. Keep 'py' as default.
+            try:
+                wrote = _write_glb_for_single_shape(solid, out_dir, filename, units=units)
+            except Exception as e:
+                print(f"[cad_out] RWGltf path raised (unexpected): {e}")
+                wrote = None
+
+        if (wrote is None) and (glb_backend in ("auto", "py")):
+            wrote = _export_glb_py_from_shape(solid, out_dir, filename)
+
+        if wrote is None:
+            print(f"[cad_out] GLB not created for {filename} (backend={glb_backend})")
+
     return step_path
 
 # -------------------------
@@ -924,3 +1508,163 @@ def export_solid_to_stl(
         raise RuntimeError("Failed to write STL")
 
     return str(stl_path)
+
+# # -------------------------
+# # Manifest writer (viewer-friendly)
+# # -------------------------
+# from pathlib import Path
+# import json
+# import shutil
+
+# def _ensure_mat4(T):
+#     # Accept list of 16 or nested 4x4; return nested 4x4
+#     if isinstance(T, (list, tuple)) and len(T) == 16:
+#         return [list(T[0:4]), list(T[4:8]), list(T[8:12]), list(T[12:16])]
+#     if isinstance(T, (list, tuple)) and len(T) == 4 and all(len(r) == 4 for r in T):
+#         return [list(r) for r in T]
+#     raise ValueError(f"Bad transform, expected 16 elems or 4x4: {T}")
+
+# def _copy_if(src: Path, dst: Path):
+#     dst.parent.mkdir(parents=True, exist_ok=True)
+#     if src.exists():
+#         if str(src.resolve()) != str(dst.resolve()):
+#             shutil.copyfile(str(src), str(dst))
+#         return True
+#     return False
+
+# def write_viewer_manifest(
+#     pack_root: str | Path,
+#     df_unique,
+#     df_instances,
+#     *,
+#     project_number: str | None = None,
+#     units: str = "MM",
+#     # how to find per-part GLBs:
+#     unique_part_id_col="part_id",
+#     unique_name_col="name",
+#     unique_glb_col="glb_path",          # if not given, we’ll derive from step and rename
+#     unique_step_col="step_path",         # used as a fallback to deduce where the GLB should be
+#     # instance mapping:
+#     inst_part_id_col="part_id",
+#     inst_name_col="name",
+#     inst_parent_col="parent_asm",        # optional
+#     inst_T_col="T",
+#     inst_id_col="instance_id",           # optional
+#     # assemblies (optional): pass a DataFrame or leave None
+#     df_assemblies=None,                  # expects columns: asm_id, name, parent_id, matrix
+#     # mesh inlining (optional):
+#     inline_mesh=False,                   # if True, embed vertices/triangles (and metadata) for each part
+#     inline_vertices_col="vertices",      # Nx3 floats
+#     inline_triangles_col="triangles",    # Mx3 ints
+#     inline_props_cols=None,              # list of property column names to carry into part dict
+# ):
+#     """
+#     Writes: <pack_root>/manifest.json and copies per-part GLBs into <pack_root>/defs/<part_id>.glb
+#     Shapes supported:
+#       - Simple (no assemblies)
+#       - With assemblies
+#       - Inline mesh & metadata (optional)
+#     """
+#     pack_root = Path(pack_root)
+#     defs_dir = pack_root / "defs"
+#     defs_dir.mkdir(parents=True, exist_ok=True)
+
+#     # ---- Build parts entries
+#     parts_out = []
+#     partid_to_rel = {}
+
+#     for _, row in df_unique.iterrows():
+#         pid = str(row[unique_part_id_col])
+
+#         # where is the GLB coming from?
+#         glb_src = None
+#         if unique_glb_col in row and row[unique_glb_col]:
+#             glb_src = Path(str(row[unique_glb_col]))
+#         elif unique_step_col in row and row[unique_step_col]:
+#             # convention: your pipeline names "<filename>.glb" near the step
+#             step_src = Path(str(row[unique_step_col]))
+#             # Try sibling with same stem:
+#             guess = step_src.with_suffix(".glb")
+#             if guess.exists():
+#                 glb_src = guess
+#         # destination inside defs/
+#         glb_dst = defs_dir / f"{pid}.glb"
+#         if glb_src and _copy_if(glb_src, glb_dst):
+#             glb_rel = f"defs/{pid}.glb"
+#         else:
+#             glb_rel = None  # may be missing if inline_mesh
+
+#         part_rec = {"def_id": f"hash:{pid}"}
+
+#         if inline_mesh:
+#             # Inline vertices/triangles if present
+#             verts = row.get(inline_vertices_col)
+#             tris  = row.get(inline_triangles_col)
+#             if verts is not None and tris is not None:
+#                 # Make sure they are basic lists (not numpy)
+#                 V = [[float(x), float(y), float(z)] for (x, y, z) in verts]
+#                 I = [[int(a), int(b), int(c)] for (a, b, c) in tris]
+#                 part_rec["vertices"]  = V
+#                 part_rec["triangles"] = I
+#             else:
+#                 # If inline requested but missing mesh, leave a pointer if we have it
+#                 if glb_rel:
+#                     part_rec["glb_url"] = glb_rel
+#         else:
+#             if glb_rel:
+#                 part_rec["glb_url"] = glb_rel
+
+#         # Optional extra properties on the part
+#         if inline_props_cols:
+#             for c in inline_props_cols:
+#                 if c in row and row[c] is not None:
+#                     part_rec[c] = row[c]
+
+#         parts_out.append(part_rec)
+#         partid_to_rel[pid] = glb_rel
+
+#     # ---- Build instances
+#     instances_out = []
+#     for _, row in df_instances.iterrows():
+#         pid = str(row[inst_part_id_col])
+#         name = str(row[inst_name_col]) if inst_name_col and row.get(inst_name_col) is not None else pid
+#         occ_id = str(row[inst_id_col]) if inst_id_col and row.get(inst_id_col) is not None else f"occ:{name}"
+#         T = _ensure_mat4(row[inst_T_col])
+
+#         rec = {
+#             "occ_id": occ_id,
+#             "def_id": f"hash:{pid}",
+#             "name": name,
+#             "matrix": T,
+#         }
+#         if inst_parent_col and row.get(inst_parent_col) is not None:
+#             rec["parent_id"] = str(row[inst_parent_col])
+#         instances_out.append(rec)
+
+#     # ---- Assemblies (optional)
+#     assemblies_out = None
+#     if df_assemblies is not None:
+#         assemblies_out = []
+#         for _, row in df_assemblies.iterrows():
+#             a = {
+#                 "asm_id":   str(row.get("asm_id") or row.get("id") or row.get("name")),
+#                 "name":     str(row.get("name") or row.get("asm_id")),
+#                 "parent_id": row.get("parent_id"),
+#                 "matrix": _ensure_mat4(row.get("matrix") or [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+#             }
+#             assemblies_out.append(a)
+
+#     # ---- Manifest root
+#     mani = {
+#         "version": "1.0",
+#         "units": units,
+#         "parts": parts_out,
+#         "instances": instances_out,
+#     }
+#     if project_number:
+#         mani["project_number"] = project_number
+#     if assemblies_out:
+#         mani["assemblies"] = assemblies_out
+
+#     (pack_root / "manifest.json").write_text(json.dumps(mani, indent=2), encoding="utf-8")
+#     return pack_root / "manifest.json"
