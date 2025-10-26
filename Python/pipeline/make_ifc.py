@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 from pipeline.ifc_exporter import write_ifc_from_handoff, write_ifc_from_report
 
-def run_ifc_export(handoff_dir=None, report_csv=None, out_ifc=None, units="MILLIMETRE"):
+def run_ifc_export(handoff_dir=None, report_csv=None, out_ifc=None, units: str ="MM"):
     """Run IFC export from either handoff manifest or consolidated report."""
     if handoff_dir:
         handoff_dir = Path(handoff_dir)
@@ -31,7 +31,7 @@ def run_ifc_export(handoff_dir=None, report_csv=None, out_ifc=None, units="MILLI
     # Preferred: use handoff manifest
     if handoff_dir and (handoff_dir / "manifest.json").exists():
         print(f"🔹 Exporting IFC from handoff: {handoff_dir}")
-        path = path = write_ifc_from_handoff(handoff_dir, out_ifc, units=units,
+        path = write_ifc_from_handoff(handoff_dir, out_ifc, units=units,
                               lin_defl=None, ang_deg=20.0, verbose=True)
         print(f"✅ IFC created: {path}")
         return Path(path)

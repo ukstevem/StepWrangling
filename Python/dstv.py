@@ -58,7 +58,7 @@ from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3
 from pathlib import Path
 from pipeline.dupe_report import generate_duplicate_reports, generate_consolidated_report
 from pipeline.geom_alignment import robust_align_length_to_X
-from collections import defaultdict
+from pipeline.report_for_ifc_creation import build_parts_from_report
 
 from pipeline.make_ifc import run_ifc_export
 
@@ -536,6 +536,9 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
     #     min_size=2,
     # )
 
+    df_parts_rich = build_parts_from_report(report_df)  # normalized and used for source of truth in ifc creation
+    # print(df_parts.head().to_dict(orient="records"))
+
     con_html, con_csv = generate_consolidated_report(
         report_df=report_df,
         dupe_index=dupe_index_coarse,         # optional but helps list members for dupes
@@ -548,20 +551,33 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
     dump_df_to_supabase(report_for_db)
 
     # Export rebuild manifest
-    pack_dir = export_handoff_from_report(
-        report_df=report_df,
-        out_dir=handoff_path,          # you already get this from create_project_directories
-        prefer_key="auto",             # or "tolerant" if you pass tolerant_sig_rows
-        tolerant_sig_rows=tolerant_sig_rows,  # optional
+    pack_dir,  df_parts, df_instances, chosen_key = export_handoff_from_report(
+        report_df=df_parts_rich,
+        out_dir=handoff_path,                   # you already get this from create_project_directories
+        prefer_key="auto",                      # or "tolerant" if you pass tolerant_sig_rows
+        tolerant_sig_rows=tolerant_sig_rows,    # optional
         units="MM",
         schema="AP242",
+        return_tables=True,
+        parts_props_df=df_parts_rich,               # <— pass the rich DF here
+        parts_props_key="signature_hash",           # <— match df_unique.part_id
     )
+
     print("✅ Handoff Pack Created:", pack_dir)
+
+    # print("report_df")
+    # print(report_df.head().to_dict(orient="records"))
+    # print("Instances")
+    # print(df_instances.head().to_dict(orient="records"))
+    # print("Parts")
+    # print(df_parts.head().to_dict(orient="records"))
 
     # Output of rebuilt step file
     # out_step_path = str(Path(handoff_path) / "rebuilt_assembly.step")
     # rebuilt = rebuild_from_handoff(handoff_path, out_step_path)
     # print("✅ Rebuilt STEP:", rebuilt)
+
+
 
     print("\n✅ Pipeline completed. Summary saved.")
     finish_time = datetime.now()
@@ -571,7 +587,11 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
     print("Starting IFC creation")
     run_ifc_export(handoff_path)
 
-
+    # from pipeline.ifc_writer import write_ifc
+    # # parts_df and instances_df already printed in your log
+    # ifc_out = r"G:\Customer Orders\Extraction\Projects\C25001-1-1028.step\cad\IFC\model_new.ifc"
+    # _ = write_ifc(parts_df=df_parts_rich, instances_df=df_instances, out_path=ifc_out)
+    # print("✅ IFC written:", ifc_out)
 
 if __name__ == "__main__":
 
