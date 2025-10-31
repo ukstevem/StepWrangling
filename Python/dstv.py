@@ -62,6 +62,8 @@ from pipeline.report_for_ifc_creation import build_parts_from_report
 
 from pipeline.make_ifc import run_ifc_export
 
+from pipeline.vis_utils import save_yz_section_debug_png
+
 def dstv_pipeline(step_file, root_model, project_number, matl_grade):
 
     # Log start time
@@ -227,7 +229,7 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                 "length": obb_geom["aligned_extents"][0]
             }
 
-            print(cs_data)
+            # print(cs_data)
 
             # STEP 5: Match profile
             profile_match = classify_profile(cs_data, json_path, tol_dim=1.0, tol_area=.05)
@@ -343,23 +345,56 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                 # print("=== after align OBB to DSTV ===")
                 # metrics3 = describe_shape(primary_aligned_shape)
 
-                dstv_frame = gp_Ax3(
-                    gp_Pnt(0, 0, 0),
-                    gp_Dir(obb_geom["aligned_dir_z"].XYZ()),  # thickness
-                    gp_Dir(obb_geom["aligned_dir_x"].XYZ()),  # length
-                )
+                # dstv_frame = gp_Ax3(
+                #     gp_Pnt(0, 0, 0),
+                #     gp_Dir(obb_geom["aligned_dir_z"].XYZ()),  # thickness
+                #     gp_Dir(obb_geom["aligned_dir_x"].XYZ()),  # length
+                # )
 
                 # STEP 8: Final orientation refinement
-                refined_shape, obb_geom = refine_profile_orientation(
-                    primary_aligned_shape, profile_match, compute_obb_geometry(primary_aligned_shape)
+                # refined_shape, obb_geom = refine_profile_orientation(
+                #     primary_aligned_shape,
+                #     profile_match,
+                #     compute_obb_geometry(primary_aligned_shape)
+                # )
+
+                from pipeline.geometry_utils import compute_dstv_pose, _solid_centroid, _bbox_local
+
+                step_path = Path(step_path)
+                debug_dir = step_path / "debug_views"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                ref_png = debug_dir / f"{member_id}_refined.png"
+
+                refined_shape, dstv_frame, t_world_to_dstv, diag = compute_dstv_pose(
+                    primary_aligned_shape,
+                    profile_match.get("Profile_type", ""),   # "U" or "L"
+                    profile_match.get("JSON") or profile_match.get("STEP") or {},
+                    channel_mode="web_at_z0"
+                )
+                print(f"[dstv_pose] type={profile_match.get('Profile_type','')} "
+                    f"turns={diag['turns_about_X']} y'={diag['y_norm']:.3f} z'={diag['z_norm']:.3f} "
+                    f"policy={diag['policy']} conf={diag['confidence']}")
+                
+                xmin,xmax,ymin,ymax,zmin,zmax = _bbox_local(refined_shape)
+                print(f"[pose-check] {member_id} bbox mins: X={xmin:.3f} Y={ymin:.3f} Z={zmin:.3f}  "
+                    f"(should be ~0.000)")
+
+
+                # debug Y/Z PNG from the final pose (no slicing)
+                xmin,xmax,ymin,ymax,zmin,zmax = _bbox_local(refined_shape)
+                H, W = (ymax-ymin), (zmax-zmin)
+                cg_pt = _solid_centroid(refined_shape)
+                save_yz_section_debug_png(
+                    refined_shape, dstv_frame, ref_png,
+                    H=H, W=W, title=f"{member_id} refined",
+                    cg_yz=(float(cg_pt.Y()-ymin), float(cg_pt.Z()-zmin))
                 )
 
+                # dstv_frame  = gp_Ax3(gp_Pnt(0,0,0), gp_Dir(0,0,1), gp_Dir(1,0,0))  # Z up, X forward
+                origin_dstv = gp_Pnt(0,0,0)
+
                 obb_geom = compute_obb_geometry(refined_shape)
-
                 print(f"✅ Orientation refinement complete. New extents: {obb_geom['aligned_extents']}")
-
-                # print("=== after final refinement ===")
-                # metrics2 = describe_shape(primary_aligned_shape)
 
                 # cad output
                 # export_solid_to_brep(shape_orig, brep_path, member_id)
@@ -368,21 +403,9 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                 step_file = export_solid_to_step(refined_shape, step_path, member_id)
                 stl_file = export_solid_to_stl(refined_shape, stl_path, member_id)
                 brep_fingerprint, brep_file = export_solid_to_brep(refined_shape, brep_path, member_id)
-
-                # # after refine_profile_orientation and compute_obb_geometry
-                # print(">>> OBB extents (L, H, W):", obb_geom["aligned_extents"])
-                # for axis_name in ["x", "y", "z"]:
-                #     vec = obb_geom[f"aligned_dir_{axis_name}"]
-                #     xyz = vec.XYZ()
-                #     print(f">>> aligned_dir_{axis_name}: "
-                #         f"({xyz.X():.6f}, {xyz.Y():.6f}, {xyz.Z():.6f})")
-
-                ## define the DSTV frame and axis direction from geometry
-                dstv_frame = gp_Ax3(
-                    gp_Pnt(0, 0, 0),
-                    gp_Dir(obb_geom["aligned_dir_z"].XYZ()),
-                    gp_Dir(obb_geom["aligned_dir_x"].XYZ())
-                )
+            
+                # print("=== after final refinement ===")
+                # metrics2 = describe_shape(primary_aligned_shape)
 
                 # print(section_result_table(profile_match))
                 web_cuts = analyze_end_faces_web_and_flange(refined_shape, dstv_frame)
@@ -390,11 +413,14 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
 
                 # STEP 9: Classify and check holes
                 step_vals = profile_match["STEP"]
-                raw_df_holes = classify_and_project_holes_dstv(refined_shape, 
-                                                                dstv_frame,
-                                                                dstv_frame.Location(),
-                                                                step_vals["width"],
-                                                                step_vals["height"])
+                raw_df_holes = classify_and_project_holes_dstv(
+                    refined_shape,
+                    dstv_frame,
+                    origin_dstv,
+                    width_mm=W,
+                    flange_span_mm=W  # for channels; for angles you might use H/W as needed
+                )
+
                 # For report
                 obb_x = float(step_vals["length"])
                 obb_y = float(step_vals["height"])
@@ -676,13 +702,16 @@ if __name__ == "__main__":
     step02153b = "118206 - TRAVERSE BEAM 2 FRAME.step"
     step02153c = "118716 - TRAVERSE BEAM 2 FRAME SHORT.step"
 
-    step_files = [step1028]
+    #BWB
+    step10268 = "10268_FRAME.step"
+
+    step_files = [step10268]
 
     for step_file in step_files:
         # step_file = step02153b
         step_path = str(Path(home_path).joinpath(step_file))
 
-        project = "9999"
+        project = "10268"
         # project = "test"
         # project = "02086"
         grade = "Mixed"
