@@ -342,22 +342,6 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                     obb_geom["aligned_dir_z"],
                 )
 
-                # print("=== after align OBB to DSTV ===")
-                # metrics3 = describe_shape(primary_aligned_shape)
-
-                # dstv_frame = gp_Ax3(
-                #     gp_Pnt(0, 0, 0),
-                #     gp_Dir(obb_geom["aligned_dir_z"].XYZ()),  # thickness
-                #     gp_Dir(obb_geom["aligned_dir_x"].XYZ()),  # length
-                # )
-
-                # STEP 8: Final orientation refinement
-                # refined_shape, obb_geom = refine_profile_orientation(
-                #     primary_aligned_shape,
-                #     profile_match,
-                #     compute_obb_geometry(primary_aligned_shape)
-                # )
-
                 from pipeline.geometry_utils import compute_dstv_pose, _solid_centroid, _bbox_local
 
                 step_path = Path(step_path)
@@ -413,12 +397,14 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
 
                 # STEP 9: Classify and check holes
                 step_vals = profile_match["STEP"]
+
                 raw_df_holes = classify_and_project_holes_dstv(
                     refined_shape,
                     dstv_frame,
-                    origin_dstv,
+                    origin_dstv=gp_Pnt(0,0,0),
                     width_mm=W,
-                    flange_span_mm=W  # for channels; for angles you might use H/W as needed
+                    flange_span_mm=H,
+                    profile_match=profile_match
                 )
 
                 # For report
@@ -543,24 +529,6 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
         tolerant_sig_rows,
         step=1.0,  # try 1.0 mm first; bump to 2.0 mm if you still miss repeats
     )
-
-    # # Write condensed duplicate bucket report alongside your main HTML
-    # generate_duplicate_reports(
-    #     report_df=report_df,
-    #     dupe_index=dupe_index,
-    #     output_dir=report_path,
-    #     project_number=project_number,
-    #     min_size=2  # only groups with 2+ members
-    #     )
-    
-    # # Coarse report (dimension-only)
-    # generate_duplicate_reports(
-    #     report_df=report_df,
-    #     dupe_index=dupe_index_coarse,
-    #     output_dir=report_path,
-    #     project_number=f"{project_number}_coarse",  # file gets the _coarse suffix
-    #     min_size=2,
-    # )
 
     df_parts_rich = build_parts_from_report(report_df)  # normalized and used for source of truth in ifc creation
     # print(df_parts.head().to_dict(orient="records"))
@@ -705,13 +673,16 @@ if __name__ == "__main__":
     #BWB
     step10268 = "10268_FRAME.step"
 
-    step_files = [step10268]
+    #channel detect failure
+    step0164 = "MEM-0164.step"
+
+    step_files = [step1028]
 
     for step_file in step_files:
         # step_file = step02153b
         step_path = str(Path(home_path).joinpath(step_file))
 
-        project = "10268"
+        project = "9999"
         # project = "test"
         # project = "02086"
         grade = "Mixed"

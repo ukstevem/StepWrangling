@@ -28,76 +28,173 @@ def get_face_normal(face, u=0.5, v=0.5):
     normal_vec = gp_vec_u.Crossed(gp_vec_v)
     return np.array([normal_vec.X(), normal_vec.Y(), normal_vec.Z()])
 
-def classify_and_project_holes_dstv(solid, dstv_frame, origin_dstv, width_mm, flange_span_mm):
-    explorer = TopExp_Explorer(solid, TopAbs_EDGE)
-    edges = []
+def classify_and_project_holes_dstv(
+    solid, dstv_frame, origin_dstv,
+    width_mm, flange_span_mm,
+    profile_match: dict
+):
+    """
+    Classify & project circular holes to DSTV coordinates for U / I / L profiles.
 
+    Assumes the shape is already in FINAL DSTV pose:
+      - origin at min corner (0,0,0)
+      - X = length (L),  Y = height (H),  Z = width (W)
+
+    Conventions:
+      - Channels (U): web at Z=0, flanges at Y≈0 (O) and Y≈H (U).
+      - Beams (I):    web at Z≈W/2, flanges at Y≈0 (O) and Y≈H (U).
+      - Angles (L):   heel at origin; legs along Y≈0 (→ code 'U') and Z≈0 (→ code 'H').
+    """
+    # ---- pull type & dims (safe floats) ----
+    ptype = (profile_match or {}).get("Profile_type", "")  # "U" | "I" | "L"
+    dims  = (profile_match or {}).get("JSON") or (profile_match or {}).get("STEP") or {}
+
+    def _as_float(x, default=None):
+        if isinstance(x, (int, float)): return float(x)
+        if isinstance(x, str):
+            import re
+            s = x.replace(",", "").strip()
+            m = re.search(r"-?\d+(?:\.\d+)?", s)
+            if m:
+                try: return float(m.group(0))
+                except: pass
+        return default
+
+    tw = _as_float(dims.get("web_thickness"))
+    tf = _as_float(dims.get("flange_thickness"))
+    t_leg = _as_float(dims.get("thickness"))  # for angles if available
+
+    # ---- frame basis ----
     origin_np = np.array([origin_dstv.X(), origin_dstv.Y(), origin_dstv.Z()])
     L = np.array([dstv_frame.XDirection().X(), dstv_frame.XDirection().Y(), dstv_frame.XDirection().Z()])
     F = np.array([dstv_frame.YDirection().X(), dstv_frame.YDirection().Y(), dstv_frame.YDirection().Z()])
     W = np.array([dstv_frame.Direction().X(),   dstv_frame.Direction().Y(),   dstv_frame.Direction().Z()])
 
-    width_tol = 0.5 * width_mm + 10  # for V face
-    flange_tol = 15  # for U and O face distance from DSTV plane
+    # ---- tolerances per type ----
+    def _tol_web_at_z0():
+        # tight around web plane Z=0
+        return max(1.0, 0.5*(tw or 0.0) + 1.0) if tw else max(1.0, 0.03*max(width_mm, 1.0))
 
-    seen_keys = set()
-    hole_rows = []
+    def _tol_flange_y():
+        # around Y=0 or Y=H
+        return max(1.0, 0.5*(tf or 0.0) + 1.0) if tf else max(1.0, 0.02*max(flange_span_mm, 1.0))
+
+    def _tol_web_at_zmid():
+        # for beams: web near Z=W/2
+        return max(1.0, 0.5*(tw or 0.0) + 1.0) if tw else max(1.0, 0.03*max(width_mm, 1.0))
+
+    def _tol_angle_y():
+        # Y-leg near Y=0
+        base = (t_leg or tf or 0.0)
+        return max(1.0, 0.5*base + 1.0) if base else max(1.0, 0.02*max(flange_span_mm, 1.0))
+
+    def _tol_angle_z():
+        # Z-leg near Z=0
+        base = (t_leg or tw or 0.0)
+        return max(1.0, 0.5*base + 1.0) if base else max(1.0, 0.03*max(width_mm, 1.0))
+
+    cos_ok_web = 0.6     # axis alignment threshold (|dot|) for web normal
+    cos_ok_fl  = 0.6     # for flange/leg normals
+
+    # ---- iterate circular edges ----
+    explorer = TopExp_Explorer(solid, TopAbs_EDGE)
+    seen_keys, hole_rows = set(), []
 
     while explorer.More():
         edge = topods.Edge(explorer.Current())
+        explorer.Next()  # advance now; `continue` jumps to next edge
+
         curve = BRepAdaptor_Curve(edge)
         if curve.GetType() != GeomAbs_Circle:
-            explorer.Next()
             continue
 
-        circ = curve.Circle()
-        center = circ.Location()
-        axis = circ.Axis().Direction()
+        circ    = curve.Circle()
+        center  = circ.Location()
+        axis    = circ.Axis().Direction()
+        radius  = circ.Radius()
 
-        center_np = np.array([center.X(), center.Y(), center.Z()])
-        axis_np = np.array([axis.X(), axis.Y(), axis.Z()])
-        axis_np /= np.linalg.norm(axis_np)
-        radius = circ.Radius()
+        center_np = np.array([center.X(), center.Y(), center.Z()], dtype=float)
+        axis_np   = np.array([axis.X(),   axis.Y(),   axis.Z()], dtype=float)
+        nrm = np.linalg.norm(axis_np)
+        if nrm == 0.0:
+            continue
+        axis_np /= nrm
 
-        v = center_np - origin_np
-        d_web = abs(np.dot(v, W))
-        d_flange = np.dot(v, F)
+        v = center_np - origin_np                 # vector from origin
+        y_along = float(np.dot(v, F))             # signed Y
+        z_along = float(np.dot(v, W))             # signed Z
+        d_web_z0  = abs(z_along)                  # distance to Z=0
+        d_web_zmid= abs(z_along - 0.5*width_mm)   # distance to Z=W/2
+        dotW = abs(float(np.dot(axis_np, W)))     # ignore sign
+        dotF = abs(float(np.dot(axis_np, F)))     # ignore sign
 
-        dot_web = abs(np.dot(axis_np, W))
-        dot_flange = np.dot(axis_np, F)
+        # ---- face classification by profile type ----
+        code = None
+        y_axis = None
 
-        # Classify by proximity and direction
-        if d_web <= width_tol and dot_web > 0.7:
-            code = 'V'
-            y_axis = F
-        elif abs(d_flange) <= flange_tol and dot_flange < -0.7:
-            code = 'U'
-            y_axis = W
-        elif abs(d_flange - flange_span_mm) <= flange_tol and dot_flange > 0.7:
-            code = 'O'
-            y_axis = W
+        if ptype == "U":
+            # Channel: web at Z=0
+            tol_web    = _tol_web_at_z0()
+            tol_flange = _tol_flange_y()
+
+            if (d_web_z0 <= tol_web) and (dotW >= cos_ok_web):
+                code, y_axis = "V", F
+            elif (abs(y_along - 0.0) <= tol_flange) and (dotF >= cos_ok_fl):
+                code, y_axis = "O", W
+            elif (abs(y_along - flange_span_mm) <= tol_flange) and (dotF >= cos_ok_fl):
+                code, y_axis = "U", W
+
+        elif ptype == "I":
+            # Beam: web at Z≈W/2
+            tol_web    = _tol_web_at_zmid()
+            tol_flange = _tol_flange_y()
+
+            if (d_web_zmid <= tol_web) and (dotW >= cos_ok_web):
+                code, y_axis = "V", F
+            elif (abs(y_along - 0.0) <= tol_flange) and (dotF >= cos_ok_fl):
+                code, y_axis = "O", W
+            elif (abs(y_along - flange_span_mm) <= tol_flange) and (dotF >= cos_ok_fl):
+                code, y_axis = "U", W
+
+        elif ptype == "L":
+            # Angle: legs on Y≈0 and Z≈0
+            tol_y = _tol_angle_y()
+            tol_z = _tol_angle_z()
+
+            if (abs(y_along - 0.0) <= tol_y) and (dotF >= cos_ok_fl):
+                code, y_axis = "U", W     # Y-leg → 'U' (matches your face map for L)
+            elif (abs(z_along - 0.0) <= tol_z) and (dotW >= cos_ok_web):
+                code, y_axis = "H", F     # Z-leg → 'H'
+
         else:
-            explorer.Next()
+            # Unsupported/unknown type — skip
             continue
 
+        if code is None:
+            continue
+
+        # ---- DSTV coordinates ----
         x = round(float(np.dot(v, L)), 2)
         y = round(float(np.dot(v, y_axis)), 2)
 
         key = (round(x, 1), round(y, 1), round(radius, 2), code)
         if key in seen_keys:
-            explorer.Next()
             continue
         seen_keys.add(key)
 
         hole_rows.append({
             "Hole #":        len(hole_rows) + 1,
-            "Code":          code,
+            "Code":          code,              # 'V','U','O','H'
             "Diameter (mm)": round(radius * 2, 2),
             "X (mm)":        x,
-            "Y (mm)":        y
+            "Y (mm)":        y,
+            "Profile": ptype
         })
 
-        explorer.Next()
+    if hole_rows:
+        codes = [h["Code"] for h in hole_rows]
+        print(f"[holes] {ptype}  V={codes.count('V')}  U={codes.count('U')}  O={codes.count('O')}  H={codes.count('H')}")
+
 
     return pd.DataFrame(hole_rows)
 
