@@ -1,212 +1,295 @@
-# --- pythonocc-core imports ---
+# pipeline/geom_alignment.py
+# Minimal aligner: pick the longest straight edge (fallback: longest wire), map to +X.
+# Seed +Z from OBB secondary and orthogonalize to X. No extra “smart” rolls.
+
 from OCC.Core.TopExp import TopExp_Explorer
-from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_WIRE
+from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_WIRE, TopAbs_EDGE
 from OCC.Core.TopoDS import topods
-from OCC.Core.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
-from OCC.Core.GeomAbs import GeomAbs_Plane, GeomAbs_Line, GeomAbs_Ellipse
-from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Vec, gp_Ax3, gp_Trsf
+from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
+from OCC.Core.GeomAbs import GeomAbs_Line
+from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3, gp_Trsf, gp_Ax1
 from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform
+from OCC.Core.Bnd import Bnd_Box, Bnd_OBB
+from OCC.Core.BRepBndLib import brepbndlib
+
+import math
+import numpy as np
+
+# --- add near your imports ---
+from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
+from OCC.Core.GeomAbs import GeomAbs_Plane
 from OCC.Core.GProp import GProp_GProps
 from OCC.Core.BRepGProp import brepgprop
-from OCC.Core.BRepTools import breptools
-import numpy as np, math
 
-# ---------- helpers ----------
-def _largest_planar_face(solid):
-    exp = TopExp_Explorer(solid, TopAbs_FACE)
-    best, best_area = None, -1.0
-    while exp.More():
-        f = topods.Face(exp.Current())
-        s = BRepAdaptor_Surface(f)
-        if s.GetType() == GeomAbs_Plane:
-            props = GProp_GProps()
-            brepgprop.SurfaceProperties(f, props)
-            area = props.Mass()
-            if area > best_area:
-                best, best_area = f, area
-        exp.Next()
-    return best
+def _build_xz_frame(dir_x: gp_Dir, dir_z: gp_Dir):
+    """
+    Build a right-handed (X,Y,Z) frame keeping X exact and re-orthogonalising Z to X.
+    Returns: trsf, from_cs, world_cs, dx, dy, dz
+      - trsf maps (from_cs) → world_cs  (world_cs = Z up, X forward)
+      - dx,dy,dz are the unit gp_Dir of the local axes after orthonormalization
+    """
+    # X (unit)
+    X = np.array([dir_x.X(), dir_x.Y(), dir_x.Z()], dtype=float)
+    nX = np.linalg.norm(X)
+    X = X / (nX if nX else 1.0)
 
-def _outer_wire(face):
-    try:
-        w = breptools.OuterWire(face)
-        if not w.IsNull():
-            return w
-    except Exception:
-        pass
-    # Fallback: pick the wire with largest perimeter estimated from straight edges
-    choice, best_sum = None, -1.0
-    wexp = TopExp_Explorer(face, TopAbs_WIRE)
-    while wexp.More():
-        w = topods.Wire(wexp.Current())
-        total = 0.0
-        eexp = TopExp_Explorer(w, TopAbs_EDGE)
-        while eexp.More():
-            e = topods.Edge(eexp.Current())
-            c = BRepAdaptor_Curve(e)
-            if c.GetType() == GeomAbs_Line:
-                p1 = c.Value(c.FirstParameter()); p2 = c.Value(c.LastParameter())
-                total += gp_Vec(p1, p2).Magnitude()
-            eexp.Next()
-        if total > best_sum:
-            choice, best_sum = w, total
-        wexp.Next()
-    return choice
+    # Z candidate → make orthogonal to X
+    Z = np.array([dir_z.X(), dir_z.Y(), dir_z.Z()], dtype=float)
+    Z = Z - np.dot(Z, X) * X
+    nZ = np.linalg.norm(Z)
+    if nZ < 1e-12:
+        # fallback "up"
+        up = np.array([0.0, 0.0, 1.0])
+        if abs(float(np.dot(up, X))) > 0.9:
+            up = np.array([0.0, 1.0, 0.0])
+        Z = up - np.dot(up, X) * X
+        nZ = np.linalg.norm(Z)
+    Z = Z / (nZ if nZ else 1.0)
 
-def _unit_np(v):
-    v = np.asarray(v, dtype=float)
-    n = np.linalg.norm(v)
-    return v / n if n > 1e-16 else v
+    # Y = Z × X  (right-handed); flip Y if needed to enforce RH
+    Y = np.cross(Z, X)
+    nY = np.linalg.norm(Y)
+    Y = Y / (nY if nY else 1.0)
+    if float(np.dot(np.cross(X, Y), Z)) < 0.0:
+        Y = -Y
 
-def _ensure_right_handed(dx: gp_Dir, dy: gp_Dir, dz: gp_Dir):
-    x = np.array([dx.X(), dx.Y(), dx.Z()])
-    y = np.array([dy.X(), dy.Y(), dy.Z()])
-    z = np.array([dz.X(), dz.Y(), dz.Z()])
-    if float(np.dot(np.cross(x, y), z)) < 0:
-        # flip Y to enforce RH (could also flip X; choose one consistently)
-        dy = gp_Dir(-dy.X(), -dy.Y(), -dy.Z())
-    return dx, dy, dz
+    dx = gp_Dir(float(X[0]), float(X[1]), float(X[2]))
+    dy = gp_Dir(float(Y[0]), float(Y[1]), float(Y[2]))
+    dz = gp_Dir(float(Z[0]), float(Z[1]), float(Z[2]))
 
-def _build_transform(dir_x: gp_Dir, dir_z: gp_Dir):
-    # Orthonormalize via Y = Z × X, then X = Y × Z
-    y = np.cross([dir_z.X(), dir_z.Y(), dir_z.Z()],
-                 [dir_x.X(), dir_x.Y(), dir_x.Z()])
-    y = _unit_np(y)
-    dir_y = gp_Dir(float(y[0]), float(y[1]), float(y[2]))
-    x2 = np.cross([dir_y.X(), dir_y.Y(), dir_y.Z()],
-                  [dir_z.X(), dir_z.Y(), dir_z.Z()])
-    x2 = _unit_np(x2)
-    dir_x = gp_Dir(float(x2[0]), float(x2[1]), float(x2[2]))
-    dir_x, dir_y, dir_z = _ensure_right_handed(dir_x, dir_y, dir_z)
-
-    origin = gp_Pnt(0, 0, 0)
-    # gp_Ax3(origin, main_dir(Z), XDir)
-    from_cs = gp_Ax3(origin, dir_z, dir_x)
-    world_cs = gp_Ax3(origin, gp_Dir(0, 0, 1), gp_Dir(1, 0, 0))
+    origin = gp_Pnt(0.0, 0.0, 0.0)
+    from_cs = gp_Ax3(origin, dz, dx)                       # local: Z main, X as XDir
+    world_cs = gp_Ax3(origin, gp_Dir(0,0,1), gp_Dir(1,0,0)) # world: Z up, X forward
 
     trsf = gp_Trsf()
     trsf.SetDisplacement(from_cs, world_cs)
-    return trsf, from_cs, world_cs, dir_x, dir_y, dir_z
+    return trsf, from_cs, world_cs, dx, dy, dz
 
-# ---------- main function ----------
-def robust_align_length_to_X(solid, tol_len=1e-3, rel_tie=1e-6, debug=False):
+def _canon_dir(v: np.ndarray) -> np.ndarray:
+    """Make direction signless: flip so its largest-magnitude component is positive."""
+    i = int(np.argmax(np.abs(v)))
+    return v if v[i] >= 0 else -v
+
+def _dominant_perp_face_normals(solid, X_unit: np.ndarray, *, dot_eps=0.2, ang_tol_deg=7.0) -> list[np.ndarray]:
     """
-    Deterministic alignment (PCA/OBB version):
-      * Choose largest planar face as reference (top/bottom).
-      * Use its OUTER wire only (ignore holes).
-      * Project outer wire edge points into the face plane and compute the
-        principal in-plane direction (major PCA/OBB axis) as the 'length'.
-      * If nearly isotropic in-plane spread, fall back to projecting world +X (or +Y) into the face.
-      * Set Z = +face normal; X = chosen in-plane direction; Y = Z×X; enforce right-handedness.
-      * Map (Z→+Z, X→+X) and return aligned shape & basis.
-
-    Returns:
-      aligned, trsf, world_cs, face, dir_x, dir_y, dir_z [, dbg]
+    Return face-normal clusters (largest-area first) that are ~perpendicular to X.
+    dot_eps≈0.2 ≈ 11.5° from perpendicular; ang_tol_deg for clustering.
     """
-    dbg = {}
+    X_unit = X_unit / (np.linalg.norm(X_unit) or 1.0)
+    clusters = []  # each: {"dir": np3, "area": float}
+    cos_tol = math.cos(math.radians(ang_tol_deg))
 
-    # 1) Reference face (largest planar)
-    face = _largest_planar_face(solid)
-    if not face:
-        raise RuntimeError("No planar face found.")
-    srf = BRepAdaptor_Surface(face)
-    if srf.GetType() != GeomAbs_Plane:
-        raise RuntimeError("Reference face is not planar.")
+    fexp = TopExp_Explorer(solid, TopAbs_FACE)
+    while fexp.More():
+        f = topods.Face(fexp.Current())
+        s = BRepAdaptor_Surface(f)
+        if s.GetType() != GeomAbs_Plane:
+            fexp.Next(); continue
 
-    # 2) Face normal → prefer +Z
-    n = srf.Plane().Axis().Direction()
-    dir_z = gp_Dir(n.X(), n.Y(), n.Z())
-    if dir_z.Z() < 0.0:
-        dir_z = gp_Dir(-dir_z.X(), -dir_z.Y(), -dir_z.Z())
-    nz = np.array([dir_z.X(), dir_z.Y(), dir_z.Z()], dtype=float)
+        pln = s.Plane()
+        n = np.array([pln.Axis().Direction().X(), pln.Axis().Direction().Y(), pln.Axis().Direction().Z()], float)
+        n /= (np.linalg.norm(n) or 1.0)
 
-    # 3) Outer wire
-    wire = _outer_wire(face)
-    if wire is None or wire.IsNull():
-        raise RuntimeError("Failed to get outer wire of reference face.")
+        # keep normals ~perpendicular to X
+        if abs(float(np.dot(n, X_unit))) > dot_eps:
+            fexp.Next(); continue
 
-    # 4) Collect edge endpoints on the outer wire
+        # area weight
+        props = GProp_GProps(); brepgprop.SurfaceProperties(f, props)
+        A = float(props.Mass()) if math.isfinite(props.Mass()) and props.Mass() > 0 else 1.0
+
+        n = _canon_dir(n)
+        assigned = False
+        for c in clusters:
+            if abs(float(np.dot(c["dir"], n))) > cos_tol:
+                # merge into cluster (area-weighted average)
+                c["dir"] = (c["dir"] * c["area"] + n * A)
+                c["dir"] /= (np.linalg.norm(c["dir"]) or 1.0)
+                c["area"] += A
+                assigned = True
+                break
+        if not assigned:
+            clusters.append({"dir": n, "area": A})
+
+        fexp.Next()
+
+    clusters.sort(key=lambda c: c["area"], reverse=True)
+    return [c["dir"] for c in clusters]
+
+def _obb_longest_axes(shape):
+    """Return [(axis_vec(np3), half_size), ...] sorted by size desc."""
+    obb = Bnd_OBB()
+    brepbndlib.AddOBB(shape, obb, True, True, True)
+    axes = [
+        (np.array([obb.XDirection().X(), obb.XDirection().Y(), obb.XDirection().Z()], float), float(obb.XHSize())),
+        (np.array([obb.YDirection().X(), obb.YDirection().Y(), obb.YDirection().Z()], float), float(obb.YHSize())),
+        (np.array([obb.ZDirection().X(), obb.ZDirection().Y(), obb.ZDirection().Z()], float), float(obb.ZHSize())),
+    ]
+    axes.sort(key=lambda t: t[1], reverse=True)
+    return axes
+
+
+def _wire_endpoints_vector(wire) -> np.ndarray | None:
+    """Approx wire direction = vector from first to last edge endpoints (model-space)."""
+    # Collect endpoints along the wire's edges in traversal order
     pts = []
     eexp = TopExp_Explorer(wire, TopAbs_EDGE)
     while eexp.More():
         e = topods.Edge(eexp.Current())
         c = BRepAdaptor_Curve(e)
-        # Note: we don't filter by curve type; endpoints are fine for polygons/chamfers
         p1 = c.Value(c.FirstParameter()); p2 = c.Value(c.LastParameter())
-        pts.append((p1.X(), p1.Y(), p1.Z()))
-        pts.append((p2.X(), p2.Y(), p2.Z()))
+        if not pts:
+            pts.append(np.array([p1.X(), p1.Y(), p1.Z()], float))
+        pts.append(np.array([p2.X(), p2.Y(), p2.Z()], float))
         eexp.Next()
+    if len(pts) < 2:
+        return None
+    v = pts[-1] - pts[0]
+    n = float(np.linalg.norm(v))
+    return (v / n) if n > 0 else None
 
-    if not pts:
-        raise RuntimeError("No edge points found on outer wire.")
 
-    # 5) Build a 2D basis (u, v) spanning the face plane
-    #    seed chosen to avoid collinearity with nz
-    seed = np.array([1.0, 0.0, 0.0], dtype=float) if abs(nz[0]) < 0.9 else np.array([0.0, 1.0, 0.0], dtype=float)
-    u = seed - np.dot(seed, nz) * nz
-    nu = float(np.linalg.norm(u))
-    if nu < 1e-12:
-        # extreme edge-on fallback
-        seed = np.array([0.0, 1.0, 0.0], dtype=float)
-        u = seed - np.dot(seed, nz) * nz
-        nu = float(np.linalg.norm(u))
-        if nu < 1e-12:
-            # pathological geometry
-            raise RuntimeError("Failed to build a stable in-plane basis.")
-    u /= nu
-    v = np.cross(nz, u); v /= float(np.linalg.norm(v))
+def _longest_straight_edge_dir(solid) -> tuple[np.ndarray | None, float]:
+    """Scan all faces/wires/edges; return (unit_dir, length) for the longest GeomAbs_Line edge."""
+    best_len = -1.0
+    best_dir = None
+    fexp = TopExp_Explorer(solid, TopAbs_FACE)
+    while fexp.More():
+        f = topods.Face(fexp.Current())
+        wexp = TopExp_Explorer(f, TopAbs_WIRE)
+        while wexp.More():
+            w = topods.Wire(wexp.Current())
+            eexp = TopExp_Explorer(w, TopAbs_EDGE)
+            while eexp.More():
+                e = topods.Edge(eexp.Current())
+                c = BRepAdaptor_Curve(e)
+                if c.GetType() == GeomAbs_Line:
+                    p1 = c.Value(c.FirstParameter()); p2 = c.Value(c.LastParameter())
+                    v = np.array([p2.X() - p1.X(), p2.Y() - p1.Y(), p2.Z() - p1.Z()], float)
+                    L = float(np.linalg.norm(v))
+                    if L > best_len and L > 0:
+                        best_len = L
+                        best_dir = v / L
+                eexp.Next()
+            wexp.Next()
+        fexp.Next()
+    return best_dir, best_len
 
-    # 6) Project 3D points to 2D plane coords (u,v)
-    P = np.empty((2, len(pts)), dtype=float)
-    for i, (x, y, z) in enumerate(pts):
-        p = np.array([x, y, z], dtype=float)
-        P[0, i] = np.dot(p, u)
-        P[1, i] = np.dot(p, v)
 
-    # 7) PCA on 2D points (centered)
-    Pc = P - P.mean(axis=1, keepdims=True)
-    denom = max(P.shape[1] - 1, 1)
-    C = (Pc @ Pc.T) / float(denom)  # 2x2 covariance
-    eigvals, eigvecs = np.linalg.eigh(C)  # ascending order
-    # largest eigenvector = major in-plane axis
-    major2d = eigvecs[:, 1]
-    lam_min, lam_max = float(eigvals[0]), float(eigvals[1])
+def _longest_wire_dir(solid) -> tuple[np.ndarray | None, float]:
+    """If no straight edge found, pick the wire with greatest chord length (end-to-end)."""
+    best_len = -1.0
+    best_dir = None
+    fexp = TopExp_Explorer(solid, TopAbs_FACE)
+    while fexp.More():
+        f = topods.Face(fexp.Current())
+        wexp = TopExp_Explorer(f, TopAbs_WIRE)
+        while wexp.More():
+            w = topods.Wire(wexp.Current())
+            v = _wire_endpoints_vector(w)
+            if v is not None:
+                L = 1.0  # v is unit; use bbox chord instead for tie-break below
+                if L > best_len:
+                    best_len = L
+                    best_dir = v
+            wexp.Next()
+        fexp.Next()
 
-    # 8) Degeneracy guard: nearly isotropic (circle-ish) → project world +X (else +Y)
-    isotropic = (lam_max <= 1e-12) or ((lam_min / lam_max) > 0.95)
-    if isotropic:
-        wx = np.array([1.0, 0.0, 0.0], dtype=float)
-        d = wx - np.dot(wx, nz) * nz
-        nd = float(np.linalg.norm(d))
-        if nd < 1e-12:
-            wy = np.array([0.0, 1.0, 0.0], dtype=float)
-            d = wy - np.dot(wy, nz) * nz
-            nd = float(np.linalg.norm(d))
-        d /= nd
+    # If tie-break needed, prefer face with overall longer bbox chord along that v
+    # (Keep it simple — generally not needed.)
+    return best_dir, best_len
+
+
+def _build_frame_and_trsf(dir_x_np: np.ndarray, dir_z_seed_np: np.ndarray):
+    """Orthonormalize Z to X, make RH frame, return (trsf, from_cs, world_cs, dx, dy, dz)."""
+    X = dir_x_np / np.linalg.norm(dir_x_np)
+    Z = dir_z_seed_np - np.dot(dir_z_seed_np, X) * X
+    nz = float(np.linalg.norm(Z))
+    if nz < 1e-12:
+        # fallback up
+        up = np.array([0.0, 0.0, 1.0])
+        if abs(np.dot(up, X)) > 0.90:
+            up = np.array([0.0, 1.0, 0.0])
+        Z = up - np.dot(up, X) * X
+        Z /= np.linalg.norm(Z)
     else:
-        d = major2d[0] * u + major2d[1] * v
-        d /= float(np.linalg.norm(d))
+        Z /= nz
+    Y = np.cross(Z, X); Y /= np.linalg.norm(Y)
+    # enforce RH (flip Y only)
+    if float(np.dot(np.cross(X, Y), Z)) < 0.0:
+        Y = -Y
 
-    # Prefer +world X to fix the sign deterministically
-    if d[0] < 0.0:
-        d = -d
+    dx = gp_Dir(float(X[0]), float(X[1]), float(X[2]))
+    dy = gp_Dir(float(Y[0]), float(Y[1]), float(Y[2]))
+    dz = gp_Dir(float(Z[0]), float(Z[1]), float(Z[2]))
 
-    dir_x = gp_Dir(float(d[0]), float(d[1]), float(d[2]))
+    origin = gp_Pnt(0, 0, 0)
+    from_cs = gp_Ax3(origin, dz, dx)            # Z as main, X as XDir
+    world_cs = gp_Ax3(origin, gp_Dir(0, 0, 1), gp_Dir(1, 0, 0))  # Z up, X forward
+    trsf = gp_Trsf(); trsf.SetDisplacement(from_cs, world_cs)
+    return trsf, from_cs, world_cs, dx, dy, dz
 
-    # 9) Build transform and return
-    trsf, from_cs, world_cs, dir_x, dir_y, dir_z = _build_transform(dir_x, dir_z)
+
+def align_by_longest_straight_edge(solid, *, debug: bool = False):
+    """
+    Minimal, semi-working aligner:
+      1) Use the LONGEST straight edge direction as +X (fallback: longest wire end-to-end).
+      2) Seed +Z from the OBB secondary axis; orthogonalize to X; build RH frame.
+      3) Displace (Z->+Z, X->+X).
+    Returns: aligned, trsf, world_cs, None, dx, dy, dz, dbg
+    """
+    dbg = {"used": "longest-edge", "longest_edge_len": 0.0}
+
+    # 1) choose X
+    edge_dir, edge_len = _longest_straight_edge_dir(solid)
+    if edge_dir is None:
+        wire_dir, _ = _longest_wire_dir(solid)
+        if wire_dir is None:
+            # final fallback: OBB longest
+            axes = _obb_longest_axes(solid)
+            X = axes[0][0] / np.linalg.norm(axes[0][0])
+            dbg["used"] = "obb-fallback"
+        else:
+            X = wire_dir
+            dbg["used"] = "longest-wire"
+    else:
+        X = edge_dir
+        dbg["used"] = "longest-edge"
+        dbg["longest_edge_len"] = float(edge_len)
+
+    # stabilize sign so X points roughly +globalX (purely cosmetic/consistent)
+    if X[0] < 0:
+        X = -X
+
+    # --- replace the Z seed block in align_by_longest_straight_edge ---
+    # X is np.array unit (longest edge). Try planar-face voting for roll.
+    face_dirs = _dominant_perp_face_normals(solid, X, dot_eps=0.2, ang_tol_deg=7.0)
+    if face_dirs:
+        # Use dominant face normal as +Y candidate, then Z = X × Y
+        Yc = face_dirs[0] - np.dot(face_dirs[0], X) * X
+        Yc /= (np.linalg.norm(Yc) or 1.0)
+        Z = np.cross(X, Yc)
+    else:
+        # Fallback: OBB secondary axis as before
+        Zcand = axes[1][0]
+        Z = Zcand - np.dot(Zcand, X) * X
+
+    Z /= (np.linalg.norm(Z) or 1.0)
+
+    dx = gp_Dir(float(X[0]), float(X[1]), float(X[2]))
+    dz = gp_Dir(float(Z[0]), float(Z[1]), float(Z[2]))
+    trsf, from_cs, world_cs, dx, dy, dz = _build_xz_frame(dx, dz)
     aligned = BRepBuilderAPI_Transform(solid, trsf, True).Shape()
+    # keep your existing _enforce_Y_ge_Z(aligned, world_cs) afterwards if you like
 
+
+    # 3) apply transform
+    # aligned = BRepBuilderAPI_Transform(solid, trsf, True).Shape()
+
+    # basic debug bbox
+    bb = Bnd_Box(); brepbndlib.Add(aligned, bb)
+    xmin, ymin, zmin, xmax, ymax, zmax = bb.Get()
     if debug:
-        ang_xy = math.degrees(math.atan2(dir_x.Y(), dir_x.X()))
-        dbg.update({
-            "mode": "wire-PCA" if not isotropic else "round-fallback(+X projected)",
-            "eigvals": (lam_min, lam_max),
-            "dir_x": (dir_x.X(), dir_x.Y(), dir_x.Z()),
-            "dir_z": (dir_z.X(), dir_z.Y(), dir_z.Z()),
-            "angle_X_deg_after": ((ang_xy + 360.0) % 360.0)
-        })
+        dbg.update({"extents_after": (xmax - xmin, ymax - ymin, zmax - zmin)})
 
-    return (aligned, trsf, world_cs, face, dir_x, dir_y, dir_z, dbg) if debug \
-         else (aligned, trsf, world_cs, face, dir_x, dir_y, dir_z)
-
+    return aligned, trsf, world_cs, None, dx, dy, dz, (dbg if debug else None)

@@ -57,12 +57,28 @@ from pipeline.rebuilder import rebuild_from_handoff
 from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3
 from pathlib import Path
 from pipeline.dupe_report import generate_duplicate_reports, generate_consolidated_report
-from pipeline.geom_alignment import robust_align_length_to_X
+from pipeline.geom_alignment import align_by_longest_straight_edge
 from pipeline.report_for_ifc_creation import build_parts_from_report
 
 from pipeline.make_ifc import run_ifc_export
 
 from pipeline.vis_utils import save_yz_section_debug_png
+
+# debug toggle
+DEBUG_SNAPSHOTS = True
+
+def _log_and_export_snapshot(shape, step_dir: Path, name: str):
+    """Write a STEP snapshot and print aligned extents for quick diffing."""
+    from pipeline.cad_out import export_solid_to_step
+    from pipeline.geometry_utils import compute_obb_geometry
+    try:
+        out = export_solid_to_step(shape, step_dir, name)
+        obb = compute_obb_geometry(shape)
+        print(f"[snapshot] {name} -> {out}")
+        print(f"[snapshot] {name} extents: {obb['aligned_extents']}")
+    except Exception as ex:
+        print(f"[snapshot] {name} failed: {ex}")
+
 
 def dstv_pipeline(step_file, root_model, project_number, matl_grade):
 
@@ -175,7 +191,14 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
 
             # STEP 1: Align to major geometry
             primary_aligned_shape, trsf, cs, largest_face, dir_x, dir_y, dir_z, dbg = \
-                robust_align_length_to_X(shape_orig, debug=True)
+                align_by_longest_straight_edge(shape_orig, debug=True)
+                        
+            # 🔎 snapshot immediately after initial alignment
+            if DEBUG_SNAPSHOTS:
+                dbg_dir = Path(step_path) / "debug_align"
+                dbg_dir.mkdir(parents=True, exist_ok=True)
+                _log_and_export_snapshot(primary_aligned_shape, dbg_dir, f"{member_id}_01_initial_aligned")
+
 
             # primary_aligned_shape, trsf, cs, largest_face, dir_x, dir_y, dir_z = robust_align_solid_from_geometry(shape_orig)
             dir_x, dir_y, dir_z = ensure_right_handed(dir_x, dir_y, dir_z)
@@ -676,7 +699,7 @@ if __name__ == "__main__":
     #channel detect failure
     step0164 = "MEM-0164.step"
 
-    step_files = [step1028]
+    step_files = [step10268]
 
     for step_file in step_files:
         # step_file = step02153b
