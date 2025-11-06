@@ -99,6 +99,77 @@ except Exception as e:
     _HAS_PYGLTFLIB = False
 
 
+from math import hypot
+
+LINE_EPS_MM = 0.1  # threshold for “near-straight”
+
+def _perp_dist_point_to_segment(p, a, b):
+    ax, ay = a; bx, by = b; px, py = p
+    vx, vy = bx - ax, by - ay
+    wx, wy = px - ax, py - ay
+    vv = vx*vx + vy*vy
+    if vv < 1e-18:
+        return hypot(wx, wy)
+    t = max(0.0, min(1.0, (wx*vx + wy*vy)/vv))
+    cx, cy = ax + t*vx, ay + t*vy
+    return hypot(px - cx, py - cy)
+
+def _dedupe_consecutive(pts, tol=1e-9):
+    out = []
+    for p in pts:
+        if not out or hypot(p[0]-out[-1][0], p[1]-out[-1][1]) > tol:
+            out.append(p)
+    return out
+
+def _simplify_closed_polyline(pts_closed, eps):
+    """
+    RDP-like simplifier for CLOSED polylines.
+    If the whole loop is within eps of a straight line -> returns [p0, p1].
+    Otherwise returns a vertex-reduced closed list (last==first).
+    """
+    if not pts_closed:
+        return []
+    closed = hypot(pts_closed[0][0]-pts_closed[-1][0], pts_closed[0][1]-pts_closed[-1][1]) < 1e-9
+    pts = pts_closed[:-1] if closed else pts_closed[:]
+    pts = _dedupe_consecutive(pts)
+
+    if len(pts) <= 2:
+        return pts[:2]
+
+    # Test whole-loop straightness by max distance to end-to-end segment
+    a, b = pts[0], pts[-1]
+    max_d = max(_perp_dist_point_to_segment(p, a, b) for p in pts[1:-1])
+    if max_d <= eps:
+        return [a, b]
+
+    # Otherwise do a light RDP on the ring
+    import numpy as np
+    arr = np.array(pts, float)
+    c = arr.mean(axis=0)
+    d = np.linalg.norm(arr - c, axis=1)
+    i0 = int(np.argmax(d))  # start at a “cornerish” point
+    ordered = pts[i0:] + pts[:i0]
+
+    def rdp(poly):
+        if len(poly) <= 2: return poly
+        a, b = poly[0], poly[-1]
+        md, mi = -1.0, -1
+        for i in range(1, len(poly)-1):
+            di = _perp_dist_point_to_segment(poly[i], a, b)
+            if di > md: md, mi = di, i
+        if md > eps:
+            L = rdp(poly[:mi+1]); R = rdp(poly[mi:])
+            return L[:-1] + R
+        else:
+            return [a, b]
+
+    simp = rdp(ordered)
+    # close
+    if hypot(simp[0][0]-simp[-1][0], simp[0][1]-simp[-1][1]) > 1e-9:
+        simp = simp + [simp[0]]
+    return simp
+
+
 
 # Optional: DXF rendering helper (qsave may not exist)
 try:
@@ -983,57 +1054,56 @@ def generate_plate_dxf(aligned_solid,
         exp_f.Next()
     if best_face is None:
         raise RuntimeError("No planar face found on solid")
+    
+    # --- Projector: ALWAYS map the chosen face to DXF XY, auto-pick XY or XZ and print which
+    srf = BRepAdaptor_Surface(best_face)
+    pln = srf.Plane()
 
-    # Projector
-    if ax3 is not None:
-        O, Xp, Yp, _ = _frame_from_ax3(ax3)
-        project_uv = lambda P3: _project_uv_ax3(P3, O, Xp, Yp)
-    else:
-        O, Xp, Yp, _ = _stable_plane_frame(best_face)
-        project_uv = lambda P3: _project_uv(P3, O, Xp, Yp)
+    Of = np.array([pln.Location().X(), pln.Location().Y(), pln.Location().Z()], dtype=float)
+    N  = np.array([pln.Axis().Direction().X(),
+                pln.Axis().Direction().Y(),
+                pln.Axis().Direction().Z()], dtype=float)
+    N /= max(np.linalg.norm(N), 1e-12)
 
-    # Ordered polylines + circles per wire
-    loops, circles = [], []
-    wexp = TopExp_Explorer(best_face, TopAbs_WIRE)
-    while wexp.More():
-        wire = wexp.Current()
+    Xg = np.array([1.0, 0.0, 0.0])
+    Yg = np.array([0.0, 1.0, 0.0])
+    Zg = np.array([0.0, 0.0, 1.0])
 
-        # ✅ Try circle first
-        as_circle = _wire_to_circle_uv(best_face, wire, project_uv)
-        if as_circle is not None:
-            circles.append(as_circle)  # (cu, cv, r)
-        else:
-            uv_pts = _ordered_uv_polyline(best_face, wire, project_uv, sampling_dist=sampling_dist)
-            if uv_pts:
-                loops.append(uv_pts)
+    # If the face normal is closer to ±Z, use XY; else (closer to ±Y), use XZ.
+    dotNz = abs(float(np.dot(N, Zg)))
+    dotNy = abs(float(np.dot(N, Yg)))
+    use_xy = (dotNz >= dotNy)
 
-        wexp.Next()
+    def proj_in_plane(v):
+        v = np.array(v, dtype=float)
+        return v - np.dot(v, N) * N
 
-    # Optional BL shift
-    if put_bottom_left_at_origin and (loops or circles):
-        pts = [p for L in loops for p in L] + [(c[0], c[1]) for c in circles]
-        allp = np.array(pts, float)
-        shift = allp.min(axis=0)
-        loops = [[(u - shift[0], v - shift[1]) for (u, v) in L] for L in loops]
-        circles = [(cu - shift[0], cv - shift[1], r) for (cu, cv, r) in circles]
+    # Base in-plane axis along global X (projected into the face)
+    U = proj_in_plane(Xg)
+    if np.linalg.norm(U) < 1e-9:
+        # fallback if face normal ≈ ±X
+        U = proj_in_plane(Yg if use_xy else Zg)
+    U /= max(np.linalg.norm(U), 1e-12)
 
-    # Write DXF
-    doc = ezdxf.new("R2010")
-    try:
-        doc.header["$INSUNITS"] = 4  # mm
-    except Exception:
-        pass
-    msp = doc.modelspace()
-    for pts in loops:
-        if len(pts) >= 2:
-            msp.add_lwpolyline(pts, format="xy", close=True)
-    # ✅ real circles
-    for (cu, cv, r) in circles:
-        msp.add_circle((cu, cv), r)
+    # Second in-plane axis from the chosen route (XY or XZ), then GS-orthonormalize
+    B = Yg if use_xy else Zg
+    V = proj_in_plane(B)
+    V = V - np.dot(V, U) * U
+    if np.linalg.norm(V) < 1e-9:
+        V = np.cross(N, U)
+    V /= max(np.linalg.norm(V), 1e-12)
 
-    doc.saveas(str(filename))
-    print(f"DXF written to {filename}")
-    return filename
+    # Right-handed wrt N
+    if np.dot(np.cross(U, V), N) < 0:
+        V = -V
+
+    O = Of  # origin on the face plane
+    route = "XY" if use_xy else "XZ"
+    print(f"[DXF] projection route={route}  |N·Z|={dotNz:.3f}  |N·Y|={dotNy:.3f}  N={N}")
+
+    project_uv = lambda P3: _project_uv(P3, O, U, V)
+
+
 
 # -------------------------
 # DXF render (matplotlib)
@@ -1284,6 +1354,83 @@ def export_profile_dxf_with_pca(
 ) -> Tuple[str, Path, Path]:
     dxf_path = Path(dxf_path)
 
+    # -------------------------
+    # Local helpers (near-straight promotion + simplify)
+    # -------------------------
+    LINE_EPS_MM = 0.1  # <= this deviation → output a single DXF LINE
+
+    from math import hypot
+
+    def _perp_dist_point_to_segment(p, a, b):
+        ax, ay = a; bx, by = b; px, py = p
+        vx, vy = bx - ax, by - ay
+        wx, wy = px - ax, py - ay
+        vv = vx*vx + vy*vy
+        if vv < 1e-18:
+            return hypot(wx, wy)
+        t = max(0.0, min(1.0, (wx*vx + wy*vy)/vv))
+        cx, cy = ax + t*vx, ay + t*vy
+        return hypot(px - cx, py - cy)
+
+    def _dedupe_consecutive(pts, tol=1e-9):
+        out = []
+        for p in pts:
+            if not out or hypot(p[0]-out[-1][0], p[1]-out[-1][1]) > tol:
+                out.append(p)
+        return out
+
+    def _simplify_closed_polyline(pts_closed, eps):
+        """
+        If the entire (closed) loop is within eps of a straight segment,
+        return [p0, p1] so we can emit a single LINE.
+        Otherwise return a simplified closed list (last == first).
+        """
+        if not pts_closed:
+            return []
+        closed = hypot(pts_closed[0][0]-pts_closed[-1][0], pts_closed[0][1]-pts_closed[-1][1]) < 1e-9
+        pts = pts_closed[:-1] if closed else pts_closed[:]
+        pts = _dedupe_consecutive(pts)
+        if len(pts) <= 2:
+            return pts[:2]
+
+        # Straightness test against end-to-end segment
+        a, b = pts[0], pts[-1]
+        max_d = 0.0
+        for p in pts[1:-1]:
+            d = _perp_dist_point_to_segment(p, a, b)
+            if d > max_d:
+                max_d = d
+        if max_d <= eps:
+            return [a, b]
+
+        # Light RDP (ring-safe)
+        arr = np.array(pts, float)
+        c = arr.mean(axis=0)
+        d = np.linalg.norm(arr - c, axis=1)
+        i0 = int(np.argmax(d))  # start near a corner
+        ordered = pts[i0:] + pts[:i0]
+
+        def rdp(poly):
+            if len(poly) <= 2:
+                return poly
+            a, b = poly[0], poly[-1]
+            md, mi = -1.0, -1
+            for i in range(1, len(poly)-1):
+                di = _perp_dist_point_to_segment(poly[i], a, b)
+                if di > md:
+                    md, mi = di, i
+            if md > eps:
+                L = rdp(poly[:mi+1]); R = rdp(poly[mi:])
+                return L[:-1] + R
+            else:
+                return [a, b]
+
+        simp = rdp(ordered)
+        # ensure closed
+        if hypot(simp[0][0]-simp[-1][0], simp[0][1]-simp[-1][1]) > 1e-9:
+            simp = simp + [simp[0]]
+        return simp
+
     # 1) Largest planar face
     best_face, best_area = None, 0.0
     exp = TopExp_Explorer(shape, TopAbs_FACE)
@@ -1302,9 +1449,59 @@ def export_profile_dxf_with_pca(
 
     # ---- Path A: ax3 projection (no PCA) ----
     if ax3 is not None:
-        O, Xp, Yp, _ = _frame_from_ax3(ax3)
-        project_uv = lambda P3: _project_uv_ax3(P3, O, Xp, Yp)
+        # Face plane origin & normal
+        surf = BRepAdaptor_Surface(best_face)
+        pln = surf.Plane()
+        Of = np.array([pln.Location().X(), pln.Location().Y(), pln.Location().Z()], dtype=float)
+        N  = np.array([pln.Axis().Direction().X(),
+                       pln.Axis().Direction().Y(),
+                       pln.Axis().Direction().Z()], dtype=float)
+        N /= max(np.linalg.norm(N), 1e-12)
 
+        # Ax3 basis as numpy (X, Y, Z)
+        Xa = np.array([ax3.XDirection().X(), ax3.XDirection().Y(), ax3.XDirection().Z()], dtype=float)
+        Ya = np.array([ax3.YDirection().X(), ax3.YDirection().Y(), ax3.YDirection().Z()], dtype=float)
+        Za = np.array([ax3.Direction().X(),   ax3.Direction().Y(),   ax3.Direction().Z()], dtype=float)  # ax3.Z
+        for v in (Xa, Ya, Za):
+            n = np.linalg.norm(v)
+            if n > 1e-12: v /= n
+
+        def proj_in_plane(v):
+            v = np.array(v, dtype=float)
+            return v - np.dot(v, N) * N
+
+        # U = ax3.X projected into plane (fallback to best of ax3.Y/Z if degenerate)
+        U = proj_in_plane(Xa)
+        if np.linalg.norm(U) < 1e-9:
+            alt = Ya if np.linalg.norm(proj_in_plane(Ya)) >= np.linalg.norm(proj_in_plane(Za)) else Za
+            U = proj_in_plane(alt)
+        U /= max(np.linalg.norm(U), 1e-12)
+
+        # V = the better of ax3.Y or ax3.Z IN-PLANE (XY vs XZ route)
+        Yp = proj_in_plane(Ya); Zy = proj_in_plane(Za)
+        if np.linalg.norm(Yp) >= np.linalg.norm(Zy):
+            route = "XY"
+            V = Yp
+        else:
+            route = "XZ"
+            V = Zy
+
+        # Gram–Schmidt to make V orthogonal to U, then normalize
+        V = V - np.dot(V, U) * U
+        if np.linalg.norm(V) < 1e-9:
+            V = np.cross(N, U)
+        V /= max(np.linalg.norm(V), 1e-12)
+
+        # Right-handed w.r.t. N
+        if np.dot(np.cross(U, V), N) < 0:
+            V = -V
+
+        O = Of
+        print(f"[DXF] route={route}  N={N}  ||U||={np.linalg.norm(U):.3f}  ||V||={np.linalg.norm(V):.3f}")
+
+        project_uv = lambda P3: ((P3 - O).dot(U), (P3 - O).dot(V))
+
+        # Collect loops/circles
         loops, circles = [], []
         wexp = TopExp_Explorer(best_face, TopAbs_WIRE)
         while wexp.More():
@@ -1318,25 +1515,60 @@ def export_profile_dxf_with_pca(
                     loops.append(uv_pts)
             wexp.Next()
 
-        # Canonicalize
-        if canonicalize and (loops or circles):
-            pts = [p for L in loops for p in L] + [(c[0], c[1]) for c in circles]
+        # --- Promote near-straight loops to LINEs; simplify others
+        line_geoms = []   # list of ((x0,y0),(x1,y1))
+        poly_loops = []   # remaining simplified closed loops
+        for L in loops:
+            if L and (abs(L[0][0]-L[-1][0]) > 1e-9 or abs(L[0][1]-L[-1][1]) > 1e-9):
+                L = L + [L[0]]
+            simp = _simplify_closed_polyline(L, LINE_EPS_MM)
+            if len(simp) == 2:
+                line_geoms.append((simp[0], simp[1]))
+            else:
+                poly_loops.append(simp)
+
+        # Debug: check bounds before any shifting
+        if poly_loops or circles or line_geoms:
+            all_uv = [p for L in poly_loops for p in L] \
+                   + [(c[0], c[1]) for c in circles] \
+                   + [p for seg in line_geoms for p in seg]
+            arr = np.array(all_uv, float)
+            umin, vmin = arr.min(axis=0)
+            umax, vmax = arr.max(axis=0)
+            print(f"[DXF] UV bounds pre-shift: U:[{umin:.3f},{umax:.3f}]  V:[{vmin:.3f},{vmax:.3f}]")
+
+        # Canonicalize (bottom-left at origin) if requested
+        if canonicalize and (poly_loops or circles or line_geoms):
+            pts = [p for L in poly_loops for p in L] \
+                + [(c[0], c[1]) for c in circles] \
+                + [p for seg in line_geoms for p in seg]
             A = np.array(pts, float)
             mn = A.min(axis=0)
-            loops = [[(u - mn[0], v - mn[1]) for (u, v) in L] for L in loops]
-            circles = [(cu - mn[0], cv - mn[1], r) for (cu, cv, r) in circles]
+            poly_loops = [[(u - mn[0], v - mn[1]) for (u, v) in L] for L in poly_loops]
+            circles    = [(cu - mn[0], cv - mn[1], r) for (cu, cv, r) in circles]
+            line_geoms = [((p0[0]-mn[0], p0[1]-mn[1]), (p1[0]-mn[0], p1[1]-mn[1])) for (p0, p1) in line_geoms]
 
+        # Write DXF (true LINEs + LWPOLYLINEs + CIRCLEs)
         doc = ezdxf.new(dxfversion="R2010")
         try:
-            doc.header["$INSUNITS"] = 4  # millimeters
+            doc.header["$INSUNITS"] = 4  # mm
         except Exception:
             pass
-        
         msp = doc.modelspace()
-        for pts in loops:
-            msp.add_lwpolyline(pts, format="xy", close=True)
+
+        for (p0, p1) in line_geoms:
+            if hypot(p0[0]-p1[0], p0[1]-p1[1]) > 1e-9:
+                msp.add_line((p0[0], p0[1]), (p1[0], p1[1]))
+
+        for pts in poly_loops:
+            closed = abs(pts[0][0]-pts[-1][0]) < 1e-9 and abs(pts[0][1]-pts[-1][1]) < 1e-9
+            out = pts[:-1] if closed else pts
+            if len(out) >= 2:
+                msp.add_lwpolyline(out, format="xy", close=closed)
+
         for (cu, cv, r) in circles:
             msp.add_circle((cu, cv), r)
+
         doc.saveas(str(dxf_path))
 
         # Thumbnail
@@ -1346,16 +1578,15 @@ def export_profile_dxf_with_pca(
             try:
                 qsave(msp, str(thumbnail_path), bg="#FFFFFF", fg="#000000")
             except Exception:
-                _fallback_plot_segments(_loops_and_circles_to_segments(loops, circles), thumbnail_path)
+                _fallback_plot_segments(_loops_and_circles_to_segments(poly_loops, circles) + line_geoms, thumbnail_path)
         else:
-            _fallback_plot_segments(_loops_and_circles_to_segments(loops, circles), thumbnail_path)
+            _fallback_plot_segments(_loops_and_circles_to_segments(poly_loops, circles) + line_geoms, thumbnail_path)
 
         try:
             fp = compute_dxf_fingerprint(dxf_path, tol=fingerprint_tol)
         except Exception:
             fp = ""
         return fp, dxf_path, thumbnail_path
-
 
     # ---- Path B: plane-projection + PCA orientation ----
     surf = BRepAdaptor_Surface(best_face)
@@ -1408,21 +1639,46 @@ def export_profile_dxf_with_pca(
         c2 = R @ (np.array([cu, cv]) - center2d)
         circles.append((float(c2[0]), float(c2[1]), float(r)))  # radius unchanged
 
+    # --- Promote near-straight loops to LINEs; simplify others
+    line_geoms = []
+    poly_loops = []
+    for L in loops:
+        if L and (abs(L[0][0]-L[-1][0]) > 1e-9 or abs(L[0][1]-L[-1][1]) > 1e-9):
+            L = L + [L[0]]
+        simp = _simplify_closed_polyline(L, LINE_EPS_MM)
+        if len(simp) == 2:
+            line_geoms.append((simp[0], simp[1]))
+        else:
+            poly_loops.append(simp)
+
     # Canonicalize
-    if canonicalize and (loops or circles):
-        pts2 = [p for L in loops for p in L] + [(c[0], c[1]) for c in circles]
+    if canonicalize and (poly_loops or circles or line_geoms):
+        pts2 = [p for L in poly_loops for p in L] \
+             + [(c[0], c[1]) for c in circles] \
+             + [p for seg in line_geoms for p in seg]
         A = np.array(pts2, float)
         mn = A.min(axis=0)
-        loops = [[(u - mn[0], v - mn[1]) for (u, v) in L] for L in loops]
-        circles = [(cu - mn[0], cv - mn[1], r) for (cu, cv, r) in circles]
+        poly_loops = [[(u - mn[0], v - mn[1]) for (u, v) in L] for L in poly_loops]
+        circles    = [(cu - mn[0], cv - mn[1], r) for (cu, cv, r) in circles]
+        line_geoms = [((p0[0]-mn[0], p0[1]-mn[1]), (p1[0]-mn[0], p1[1]-mn[1])) for (p0, p1) in line_geoms]
 
     # Write DXF
     doc = ezdxf.new(dxfversion="R2010")
     msp = doc.modelspace()
-    for pts in loops:
-        msp.add_lwpolyline(pts, format="xy", close=True)
+
+    for (p0, p1) in line_geoms:
+        if hypot(p0[0]-p1[0], p0[1]-p1[1]) > 1e-9:
+            msp.add_line((p0[0], p0[1]), (p1[0], p1[1]))
+
+    for pts in poly_loops:
+        closed = abs(pts[0][0]-pts[-1][0]) < 1e-9 and abs(pts[0][1]-pts[-1][1]) < 1e-9
+        out = pts[:-1] if closed else pts
+        if len(out) >= 2:
+            msp.add_lwpolyline(out, format="xy", close=closed)
+
     for (cu, cv, r) in circles:
         msp.add_circle((cu, cv), r)
+
     doc.saveas(str(dxf_path))
 
     # Thumbnail
@@ -1432,13 +1688,12 @@ def export_profile_dxf_with_pca(
         try:
             qsave(msp, str(thumbnail_path), bg='#FFFFFF', fg='#000000')
         except Exception:
-            _fallback_plot_segments(_loops_and_circles_to_segments(loops, circles), thumbnail_path)
+            _fallback_plot_segments(_loops_and_circles_to_segments(poly_loops, circles) + line_geoms, thumbnail_path)
     else:
-        _fallback_plot_segments(_loops_and_circles_to_segments(loops, circles), thumbnail_path)
+        _fallback_plot_segments(_loops_and_circles_to_segments(poly_loops, circles) + line_geoms, thumbnail_path)
 
     fp = compute_dxf_fingerprint(dxf_path, tol=fingerprint_tol)
     return fp, dxf_path, thumbnail_path
-
 
 
 def _fallback_plot_segments(segments, out_path):

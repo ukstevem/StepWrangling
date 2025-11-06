@@ -11,22 +11,19 @@ from pipeline.signature_utils import (compute_signature_info,
                                         bucket_by_signature,
                                         coarse_key_from_half_sorted,
                                         bucket_by_coarse_extents) 
-from pipeline.geometry_utils import (robust_align_solid_from_geometry, 
+from pipeline.geometry_utils import (
                                      ensure_right_handed, 
                                      compute_obb_geometry, 
                                      compute_section_area,
                                      swap_width_and_height_if_required,
                                      compute_dstv_origin,
                                      align_obb_to_dstv_frame,
-                                     refine_profile_orientation,
                                      count_solids_in_shape,
                                      CSA_DIAG)
-from pipeline.shape_inspector import (describe_shape)
 from pipeline.assembly_management import (
                                      fingerprint_solids
                                      )
 from pipeline.classification import classify_profile
-from pipeline.summary_writer import section_result_table
 from pipeline.dstv_geometry import (classify_and_project_holes_dstv,
                                     check_duplicate_holes,
                                     analyze_end_faces_web_and_flange
@@ -37,32 +34,34 @@ from pipeline.drilling import (generate_hole_projection_html)
 from pipeline.cad_out import (export_solid_to_brep, 
                               shape_to_thumbnail, 
                               export_solid_to_step,
-                              generate_plate_dxf,
-                              render_dxf_drawing,
-                              export_solid_to_brep_and_fingerprint,
                               export_profile_dxf_with_pca, export_solid_to_stl
                               )
 from pipeline.plate_wrangling import (align_plate_to_xy_plane)
 from pipeline.report_builder import (record_solid,
                                      df_to_html_with_images,
-                                     df_to_excel_with_images,
-                                     df_to_csv_exports)
-from pipeline.path_management import (resolve_output_path,  
+                                     )
+from pipeline.path_management import (  
                                   create_project_directories)
 from pipeline.database import (dump_df_to_supabase, normalize_report_df,
                                 add_to_database
                                 )
-from pipeline.rebuild_exporter import export_handoff_from_existing, export_handoff_from_report
-from pipeline.rebuilder import rebuild_from_handoff
-from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3
+from pipeline.rebuild_exporter import export_handoff_from_report
+from pipeline.fingerprint import (
+    fingerprint_unknown, fingerprint_section, fingerprint_plate, fp_to_kwargs
+)
+from OCC.Core.gp import gp_Pnt
 from pathlib import Path
-from pipeline.dupe_report import generate_duplicate_reports, generate_consolidated_report
+from pipeline.dupe_report import generate_consolidated_report
 from pipeline.geom_alignment import align_by_longest_straight_edge
 from pipeline.report_for_ifc_creation import build_parts_from_report
 
 from pipeline.make_ifc import run_ifc_export
 
 from pipeline.vis_utils import save_yz_section_debug_png
+
+from pipeline.geometry_utils import compute_dstv_pose, _solid_centroid, _bbox_local
+
+from pipeline.fp_reports import generate_fp_reports, generate_fp_reports
 
 # debug toggle
 DEBUG_SNAPSHOTS = True
@@ -152,6 +151,7 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
         object_type = "-"
         issues = "-"
         hash = ""
+        nc_hash = ""
         dxf_thumb_file = ""
         section_shape = ""
         assembly_hash = ""
@@ -168,6 +168,7 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
         centroid_y = ""
         centroid_z = ""
         chirality = ""
+        fp = None
         print(f"\n🟦 Processing {member_id}... {datetime.now().strftime('%H:%M:%S')}")
 
         # safe defaults so the except-block can always reference inv
@@ -199,7 +200,6 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                 dbg_dir.mkdir(parents=True, exist_ok=True)
                 _log_and_export_snapshot(primary_aligned_shape, dbg_dir, f"{member_id}_01_initial_aligned")
 
-
             # primary_aligned_shape, trsf, cs, largest_face, dir_x, dir_y, dir_z = robust_align_solid_from_geometry(shape_orig)
             dir_x, dir_y, dir_z = ensure_right_handed(dir_x, dir_y, dir_z)
 
@@ -210,9 +210,6 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                 precision=3,
                 hash_type="md5"
             )
-
-            # print("=== Primary Aligned Shape ===")
-            # metrics1 = describe_shape(primary_aligned_shape)
 
             # STEP 2: Compute OBB geometry
             obb_geom = compute_obb_geometry(primary_aligned_shape)
@@ -232,7 +229,7 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                 ext_bin=1.0,
                 mom_bin=None,         # drop moments
                 use_faces=False,      # drop face counts
-                include_chirality=False
+                include_chirality=True
             )
 
             # keep for later bucketing
@@ -305,6 +302,12 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                         )
                         shape_for_export = final_aligned_solid
                         thumb_frame      = ax3
+
+                        fp = fingerprint_plate(
+                            plate_shape=final_aligned_solid, ax3=ax3,
+                            L=length_mm, W=width_mm, T=thickness_mm
+                            )
+
                     else:
                         # Not a section and plate guard vetoed → unknown
                         print("ℹ️  Object not identified", msg)
@@ -326,6 +329,7 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                     step_file = export_solid_to_step(shape_for_export, step_path, member_id)
                     stl_file = export_solid_to_stl(shape_for_export, stl_path, member_id)
                     brep_fingerprint, brep_file = export_solid_to_brep(shape_for_export, brep_path, member_id)
+                    fp = fingerprint_unknown(shape=shape_for_export, extents_xyz=obb_geom["aligned_extents"])
                     thumbnail_file = shape_to_thumbnail(
                         shape_for_export, thumb_path, member_id,
                         ax3=thumb_frame, camera="iso"
@@ -364,8 +368,6 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                     obb_geom["aligned_dir_y"],
                     obb_geom["aligned_dir_z"],
                 )
-
-                from pipeline.geometry_utils import compute_dstv_pose, _solid_centroid, _bbox_local
 
                 step_path = Path(step_path)
                 debug_dir = step_path / "debug_views"
@@ -448,7 +450,7 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
 
                 # STEP 10: Output
                 # NC1               
-                nc1_file, hash = generate_nc1_file(raw_df_holes, dstv_header_data, nc_path, web_cuts)
+                nc1_file, nc_hash = generate_nc1_file(raw_df_holes, dstv_header_data, nc_path, web_cuts)
                 # Drawing
                 html_file = generate_hole_projection_html(raw_df_holes, dstv_header_data, media_path, drilling_path, web_cuts)
                 # Thumbnail
@@ -457,115 +459,150 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                     refined_shape,
                     thumb_path,
                     member_id,
-                    ax3=dstv_frame,    # 👈 lock to your DSTV frame (X=length, Y=height)
+                    ax3=dstv_frame,
                     deflection=0.5,
                     px=900
+                )
+
+                # Build fingerprint USING the NC1 hash
+                L, H, W = obb_geom["aligned_extents"]
+                fp = fingerprint_section(
+                    refined_shape=refined_shape,
+                    extents_xyz=(L, H, W),
+                    section_area=section_area,
+                    profile_type=profile_match.get("Profile_type"),
+                    raw_df_holes=raw_df_holes,
+                    endcuts=web_cuts,
+                    nc1_hash=nc_hash
                 )
 
         except Exception as e:
             had_error = True
             print(f"❌ Error in {member_id}: {e}")
             record_solid(report_rows, 
-                     name = member_id,
-                     step_path = step_file,
-                     native_step_path=native_step_file,
-                     stl_path = stl_file,
-                     thumb_path = thumbnail_file,
-                     drilling_path = html_file,
-                     dxf_path = dxf_file,
-                     nc1_path = nc1_file,
-                     brep_path = brep_file,
-                     mass = step_mass,
-                     obb_x = obb_x,
-                     obb_y = obb_y,
-                     obb_z = obb_z,
-                     obj_type = object_type,
-                     issues = str(e),
-                     hash = hash,
-                     dxf_thumb_path = dxf_thumb_file,
-                     section_shape = section_shape,
-                     assembly_hash = source_model_hash,
-                     signature_hash = signature_hash,
-                     volume = inv["volume"],
-                     surface_area = inv["surface_area"],
-                     bbox_x = inv["bbox_x"],
-                     bbox_y = inv["bbox_y"],
-                     bbox_z = inv["bbox_z"],
-                     inertia_e1 = inv["inertia_ix"],
-                     inertia_e2 = inv["inertia_iy"],
-                     inertia_e3 = inv["inertia_iz"],
-                     centroid_x = inv["centroid_x"],
-                     centroid_y = inv["centroid_y"],
-                     centroid_z = inv["centroid_z"],
-                     chirality = inv["chirality"]
+                    name = member_id,
+                    step_path = step_file,
+                    native_step_path=native_step_file,
+                    stl_path = stl_file,
+                    thumb_path = thumbnail_file,
+                    drilling_path = html_file,
+                    dxf_path = dxf_file,
+                    nc1_path = nc1_file,
+                    brep_path = brep_file,
+                    mass = step_mass,
+                    obb_x = obb_x,
+                    obb_y = obb_y,
+                    obb_z = obb_z,
+                    obj_type = object_type,
+                    issues = str(e),
+                    hash = hash,
+                    nc_hash = nc_hash,
+                    dxf_thumb_path = dxf_thumb_file,
+                    section_shape = section_shape,
+                    assembly_hash = source_model_hash,
+                    signature_hash = signature_hash,
+                    volume = inv["volume"],
+                    surface_area = inv["surface_area"],
+                    bbox_x = inv["bbox_x"],
+                    bbox_y = inv["bbox_y"],
+                    bbox_z = inv["bbox_z"],
+                    inertia_e1 = inv["inertia_ix"],
+                    inertia_e2 = inv["inertia_iy"],
+                    inertia_e3 = inv["inertia_iz"],
+                    centroid_x = inv["centroid_x"],
+                    centroid_y = inv["centroid_y"],
+                    centroid_z = inv["centroid_z"],
+                    chirality = inv["chirality"],
+                    **fp_to_kwargs(fp),
              )
 
         # # Export summary
         if not had_error:
             record_solid(report_rows, 
-                     name = member_id,
-                     step_path = step_file,
-                     native_step_path=native_step_file,
-                     stl_path = stl_file,
-                     thumb_path = thumbnail_file,
-                     drilling_path = html_file,
-                     dxf_path = dxf_file,
-                     nc1_path = nc1_file,
-                     brep_path = brep_file,
-                     mass = step_mass,
-                     obb_x = obb_x,
-                     obb_y = obb_y,
-                     obb_z = obb_z,
-                     obj_type = object_type,
-                     issues = issues,
-                     hash = hash,
-                     dxf_thumb_path = dxf_thumb_file,
-                     section_shape = section_shape,
-                     assembly_hash = source_model_hash,
-                     signature_hash = signature_hash,
-                     volume = inv["volume"],
-                     surface_area = inv["surface_area"],
-                     bbox_x = inv["bbox_x"],
-                     bbox_y = inv["bbox_y"],
-                     bbox_z = inv["bbox_z"],
-                     inertia_e1 = inv["inertia_ix"],
-                     inertia_e2 = inv["inertia_iy"],
-                     inertia_e3 = inv["inertia_iz"],
-                     centroid_x = inv["centroid_x"],
-                     centroid_y = inv["centroid_y"],
-                     centroid_z = inv["centroid_z"],
-                     chirality = inv["chirality"]
+                    name = member_id,
+                    step_path = step_file,
+                    native_step_path=native_step_file,
+                    stl_path = stl_file,
+                    thumb_path = thumbnail_file,
+                    drilling_path = html_file,
+                    dxf_path = dxf_file,
+                    nc1_path = nc1_file,
+                    brep_path = brep_file,
+                    mass = step_mass,
+                    obb_x = obb_x,
+                    obb_y = obb_y,
+                    obb_z = obb_z,
+                    obj_type = object_type,
+                    issues = issues,
+                    hash = hash,
+                    nc_hash = nc_hash,
+                    dxf_thumb_path = dxf_thumb_file,
+                    section_shape = section_shape,
+                    assembly_hash = source_model_hash,
+                    signature_hash = signature_hash,
+                    volume = inv["volume"],
+                    surface_area = inv["surface_area"],
+                    bbox_x = inv["bbox_x"],
+                    bbox_y = inv["bbox_y"],
+                    bbox_z = inv["bbox_z"],
+                    inertia_e1 = inv["inertia_ix"],
+                    inertia_e2 = inv["inertia_iy"],
+                    inertia_e3 = inv["inertia_iz"],
+                    centroid_x = inv["centroid_x"],
+                    centroid_y = inv["centroid_y"],
+                    centroid_z = inv["centroid_z"],
+                    chirality = inv["chirality"],
+                    **fp_to_kwargs(fp),
                     )
 
     report_df = pd.DataFrame(report_rows)
     # print(report_df)
 
-    # Create HTML report
+   # Create HTML report
     df_to_html_with_images(report_df, report_path, project_number)
 
-    # Create Duplication Report
-    # Build duplicate buckets from tolerant_sig_rows
-    dupe_index = bucket_by_signature(tolerant_sig_rows)
-
-    # Coarse, dimensions-only groups (very forgiving, great safety net)
-    dupe_index_coarse = bucket_by_coarse_extents(
-        tolerant_sig_rows,
-        step=1.0,  # try 1.0 mm first; bump to 2.0 mm if you still miss repeats
+    # New: build both coarse + strict consolidated reports
+    reports = generate_fp_reports(
+        report_df=report_df,
+        output_dir=report_path,
+        project_number=project_number,
+        split_hand_in_family=False  # set True if you want L/R split even in the coarse view
     )
 
-    df_parts_rich = build_parts_from_report(report_df)  # normalized and used for source of truth in ifc creation
-    # print(df_parts.head().to_dict(orient="records"))
+    print("Fingerprint reports:", reports)
+
+    # === Duplicate grouping using fingerprint fields ===
+    # Strict duplicates (exact same manufactured content per route)
+    mask_strict = report_df["fp_content_key"].notna() & (report_df["fp_content_key"] != "-")
+    dupe_index_strict = (
+        report_df.loc[mask_strict]
+        .groupby(["fp_route", "fp_content_key"])["name"]
+        .apply(list)
+        .to_dict()
+    )
+
+    # Coarse families (nearby variants, e.g., same plate outline; route-aware)
+    mask_coarse = report_df["fp_family_key"].notna() & (report_df["fp_family_key"] != "-")
+    dupe_index_coarse = (
+        report_df.loc[mask_coarse]
+        .groupby("fp_family_key")["name"]
+        .apply(list)
+        .to_dict()
+    )
+
+    # (Optional) If you want to pass coarse families into your consolidated report:
+    df_parts_rich = build_parts_from_report(report_df)
 
     con_html, con_csv = generate_consolidated_report(
         report_df=report_df,
-        dupe_index=dupe_index_coarse,         # optional but helps list members for dupes
+        dupe_index=dupe_index_coarse,            # keep arg name the same as before
         output_dir=report_path,
         project_number=f"{project_number}_coarse",
     )
 
     # Log to Supabase
     report_for_db = normalize_report_df(report_df, project_number)
-    dump_df_to_supabase(report_for_db)
+    # dump_df_to_supabase(report_for_db)
 
     # Export rebuild manifest
     pack_dir,  df_parts, df_instances, chosen_key = export_handoff_from_report(
@@ -694,7 +731,7 @@ if __name__ == "__main__":
     step02153c = "118716 - TRAVERSE BEAM 2 FRAME SHORT.step"
 
     #BWB
-    step10268 = "10268_FRAME.step"
+    step10268 = "FRAME + SUPP PLATES.step"
 
     #channel detect failure
     step0164 = "MEM-0164.step"
@@ -705,9 +742,9 @@ if __name__ == "__main__":
         # step_file = step02153b
         step_path = str(Path(home_path).joinpath(step_file))
 
-        project = "9999"
+        project = "10268"
         # project = "test"
         # project = "02086"
-        grade = "Mixed"
+        grade = "S355"
 
         dstv_pipeline(step_file, step_path, project, grade)
