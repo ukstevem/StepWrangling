@@ -129,49 +129,109 @@ def classify_and_project_holes_dstv(
         dotF = abs(float(np.dot(axis_np, F)))     # ignore sign
 
         # ---- face classification by profile type ----
-        code = None
+        # code = None
+        # y_axis = None
+
+        # if ptype == "U":
+        #     # Channel: web at Z=0
+        #     tol_web    = _tol_web_at_z0()
+        #     tol_flange = _tol_flange_y()
+
+        #     if (d_web_z0 <= tol_web) and (dotW >= cos_ok_web):
+        #         code, y_axis = "V", F
+        #     elif (abs(y_along - 0.0) <= tol_flange) and (dotF >= cos_ok_fl):
+        #         code, y_axis = "O", W
+        #     elif (abs(y_along - flange_span_mm) <= tol_flange) and (dotF >= cos_ok_fl):
+        #         code, y_axis = "U", W
+
+        # elif ptype == "I":
+        #     # Beam: web at Z≈W/2
+        #     tol_web    = _tol_web_at_zmid()
+        #     tol_flange = _tol_flange_y()
+
+        #     if (d_web_zmid <= tol_web) and (dotW >= cos_ok_web):
+        #         code, y_axis = "V", F
+        #     elif (abs(y_along - 0.0) <= tol_flange) and (dotF >= cos_ok_fl):
+        #         code, y_axis = "O", W
+        #     elif (abs(y_along - flange_span_mm) <= tol_flange) and (dotF >= cos_ok_fl):
+        #         code, y_axis = "U", W
+
+        # elif ptype == "L":
+        #     # Angle: legs on Y≈0 and Z≈0
+        #     tol_y = _tol_angle_y()
+        #     tol_z = _tol_angle_z()
+
+        #     if (abs(y_along - 0.0) <= tol_y) and (dotF >= cos_ok_fl):
+        #         code, y_axis = "U", W     # Y-leg → 'U' (matches your face map for L)
+        #     elif (abs(z_along - 0.0) <= tol_z) and (dotW >= cos_ok_web):
+        #         code, y_axis = "H", F     # Z-leg → 'H'
+
+        # else:
+        #     # Unsupported/unknown type — skip
+        #     continue
+
+        # if code is None:
+        #     continue
+
+        # --- Classify by *position* (O/U/H) and keep direction only for V ---
+        code   = None
         y_axis = None
 
         if ptype == "U":
-            # Channel: web at Z=0
+            # Channel: web at Z = 0
             tol_web    = _tol_web_at_z0()
             tol_flange = _tol_flange_y()
 
             if (d_web_z0 <= tol_web) and (dotW >= cos_ok_web):
+                # Web (V)
                 code, y_axis = "V", F
-            elif (abs(y_along - 0.0) <= tol_flange) and (dotF >= cos_ok_fl):
-                code, y_axis = "O", W
-            elif (abs(y_along - flange_span_mm) <= tol_flange) and (dotF >= cos_ok_fl):
+            elif abs(y_along) <= tol_flange:
+                # lower flange  → U
                 code, y_axis = "U", W
+            elif abs(y_along - flange_span_mm) <= tol_flange:
+                # upper flange  → O
+                code, y_axis = "O", W
 
         elif ptype == "I":
-            # Beam: web at Z≈W/2
+            # Beam: web near Z = W/2
             tol_web    = _tol_web_at_zmid()
             tol_flange = _tol_flange_y()
 
             if (d_web_zmid <= tol_web) and (dotW >= cos_ok_web):
                 code, y_axis = "V", F
-            elif (abs(y_along - 0.0) <= tol_flange) and (dotF >= cos_ok_fl):
-                code, y_axis = "O", W
-            elif (abs(y_along - flange_span_mm) <= tol_flange) and (dotF >= cos_ok_fl):
+            elif abs(y_along) <= tol_flange:
                 code, y_axis = "U", W
+            elif abs(y_along - flange_span_mm) <= tol_flange:
+                code, y_axis = "O", W
 
         elif ptype == "L":
-            # Angle: legs on Y≈0 and Z≈0
+            # Angle: legs on Y ≈ 0 and Z ≈ 0
             tol_y = _tol_angle_y()
             tol_z = _tol_angle_z()
 
-            if (abs(y_along - 0.0) <= tol_y) and (dotF >= cos_ok_fl):
-                code, y_axis = "U", W     # Y-leg → 'U' (matches your face map for L)
-            elif (abs(z_along - 0.0) <= tol_z) and (dotW >= cos_ok_web):
-                code, y_axis = "H", F     # Z-leg → 'H'
+            if abs(y_along) <= tol_y:
+                # vertical leg → U face (matches your L-face map)
+                code, y_axis = "U", W
+            elif abs(z_along) <= tol_z:
+                # horizontal leg → H face
+                code, y_axis = "H", F
 
         else:
-            # Unsupported/unknown type — skip
-            continue
+            # Fallback: treat as channel-like
+            tol_web    = _tol_web_at_z0()
+            tol_flange = _tol_flange_y()
+
+            if (d_web_z0 <= tol_web) and (dotW >= cos_ok_web):
+                code, y_axis = "V", F
+            elif abs(y_along) <= tol_flange:
+                code, y_axis = "U", W
+            elif abs(y_along - flange_span_mm) <= tol_flange:
+                code, y_axis = "O", W
 
         if code is None:
             continue
+
+
 
         # ---- DSTV coordinates ----
         x = round(float(np.dot(v, L)), 2)
