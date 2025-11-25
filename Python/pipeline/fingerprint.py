@@ -102,111 +102,236 @@ def _canonical_mesh_hash(shape, deflection: float = 0.5, vert_quant: float = 0.1
         return hashlib.md5(b"mesh:error").hexdigest()
 
 # ---------- SECTION ROUTE ----------
+import pandas as pd
 
+def _hand_from_holes(df: pd.DataFrame | None) -> int:
+    """
+    Infer 'hand' from hole face codes.
+    +1  → only 'O' face present
+    -1  → only 'U' face present
+     0  → both/neither/unknown
+    """
+    if df is None or len(df) == 0:
+        return 0
+
+    # find a face/side column case-insensitively
+    cols = {c.lower(): c for c in df.columns}
+    face_col = None
+    for name in ("code", "face", "side"):
+        if name in cols:
+            face_col = cols[name]
+            break
+    if not face_col:
+        return 0
+
+    ser = df[face_col].astype(str).str.upper().str.strip()
+    has_o = ser.eq("O").any()
+    has_u = ser.eq("U").any()
+
+    if has_o and not has_u:
+        return +1
+    if has_u and not has_o:
+        return -1
+    return 0
+
+
+# --- helpers used by normalization ---
+def _swap_face_for_y_mirror(face: str) -> str:
+    f = (face or "").upper()
+    if f == "O": return "U"
+    if f == "U": return "O"
+    return f
+
+def _sorted_features(features: list[dict]) -> list[dict]:
+    return sorted(features, key=lambda h: (h.get("f",""), h.get("x",0.0), h.get("y",0.0), h.get("d",0.0), h.get("t","")))
+
+def _endcuts_to_stable_list(endcuts: dict | None) -> list[dict]:
+    """
+    End-flip invariant representation:
+    Ignore side labels; keep only normalized numeric content and sort.
+    """
+    out = []
+    if not isinstance(endcuts, dict) or not endcuts:
+        return out
+    def _round_ec(ec):
+        if not isinstance(ec, dict):
+            return {}
+        return {
+            "type": str(ec.get("type","")),
+            "n": [ _quant(float(v), 1e-3) for v in (ec.get("n") or []) ],
+            "off": _quant(float(ec.get("off", 0.0)), 0.1),
+        }
+    for k in endcuts.keys():
+        out.append(_round_ec(endcuts[k]))
+    out.sort(key=lambda e: (e.get("type",""), tuple(e.get("n",[])), e.get("off",0.0)))
+    return out
+
+
+# --- SECTION ROUTE (drop-in replacement) -------------------------------------
 def fingerprint_section(*,
                         refined_shape,
                         extents_xyz: Tuple[float, float, float],  # (L, H, W) in DSTV pose
                         section_area: float,
                         profile_type: str | None,
-                        raw_df_holes,     # pandas DF from classify_and_project_holes_dstv
+                        raw_df_holes,                     # pandas DF or None
                         endcuts: Dict[str, Any] | None = None,
+                        web_thickness: float | None = None,
+                        flange_thickness: float | None = None,
+                        root_radius: float | None = None,
+                        toe_radius: float | None = None,
                         dim_step: float = 1.0,
                         phi_step: float = 0.005,
-                        nc1_hash: str | None = None) -> Fingerprint:
+                        xy_step: float = 0.1,             # coord quantization (mm)
+                        d_step: float = 0.1,              # diameter quantization (mm)
+                        ) -> Fingerprint:
     """
-    Coarse (family): route-aware — unsorted (L,H,W), profile tag, compactness phi.
-    Content: normalized NC JSON (holes/slots/end cuts) + dims + hand flag.
-    Fallback: canonical mesh hash in DSTV frame (optional to compute).
+    Coarse (family): route='section', tag, H/W, tw/tf (if available), compactness φ.  (NO L)
+    Content (strict): normalized NC (holes+endcuts) + dims (L,H,W) + 'hand'.
+    Meta: section_leninv_key (holes normalized to nearest end → length-invariant).
     """
     L, H, W = extents_xyz
     Lq, Hq, Wq = _quant(L, dim_step), _quant(H, dim_step), _quant(W, dim_step)
     phi = (section_area / (H * W)) if (H > 0 and W > 0) else 0.0
     phiq = _quant(phi, phi_step)
-    tag = profile_type or "open"
+    tag = (profile_type or "OPEN").upper()
 
-    fam_obj = {"route": "section", "tag": tag, "L": Lq, "H": Hq, "W": Wq, "phi": phiq}
+    # Quantize thickness details if present (family only)
+    twq = _quant(web_thickness, 0.1) if web_thickness is not None else None
+    tfq = _quant(flange_thickness, 0.1) if flange_thickness is not None else None
+    rrq = _quant(root_radius, 0.1) if root_radius is not None else None
+    trq = _quant(toe_radius, 0.1) if toe_radius is not None else None
+
+    # ---------- Family key (NO LENGTH) ----------
+    fam_obj = {
+        "route": "section", "tag": tag,
+        "H": Hq, "W": Wq, "phi": phiq,
+        "tw": twq, "tf": tfq, "rr": rrq, "tr": trq,
+    }
     family_key = hashlib.md5(json.dumps(fam_obj, sort_keys=True).encode()).hexdigest()
 
-    hand = _hand_from_holes(raw_df_holes)
+    # ---------- Normalize holes / endcuts ----------
+    df = raw_df_holes if isinstance(raw_df_holes, pd.DataFrame) and len(raw_df_holes) else None
+    hand = _hand_from_holes(df)
 
-    nc_json = _normalize_nc_content(raw_df_holes, endcuts, profile_type, (Lq, Hq, Wq), hand)
-    content_key = nc1_hash or _md5_of_json(nc_json)
+    # strict (length-aware)
+    nc_strict = _normalize_nc_content_section(
+        df=df, endcuts=endcuts, tag=tag,
+        dims=(Lq, Hq, Wq), hand=hand,
+        xy_step=xy_step, d_step=d_step, length_invariant=False,
+        mirror_x_origin_canonical=True,
+    )
+    content_key = _md5_of_json(nc_strict)
 
-    # Optional: tie-breaker if you ever see collisions
-    # fallback = _canonical_mesh_hash(refined_shape)
-    fallback = None
+    # length-invariant (optional alt key for reports)
+    nc_leninv = _normalize_nc_content_section(
+        df=df, endcuts=endcuts, tag=tag,
+        dims=(Lq, Hq, Wq), hand=hand,
+        xy_step=xy_step, d_step=d_step, length_invariant=True,
+        mirror_x_origin_canonical=True,
+    )
+    leninv_key = _md5_of_json(nc_leninv)
 
-    return Fingerprint(
-            route="section",
-            family_key=family_key,
-            content_key=content_key,
-            hand=hand,
-            fallback_key=fallback,
-            meta={"profile_type": profile_type, "dims": (Lq, Hq, Wq)}
-        )
+    return Fingerprint(route="section",
+                       family_key=family_key,
+                       content_key=content_key,
+                       hand=hand,
+                       fallback_key=None,
+                       meta={
+                           "profile_type": tag,
+                           "dims": (Lq, Hq, Wq),
+                           "section_leninv_key": leninv_key
+                       })
 
-def _hand_from_holes(df) -> int:
-    if df is None or "Code" not in df.columns:
-        return 0
-    has_O = (df["Code"] == "O").any()
-    has_U = (df["Code"] == "U").any()
-    if has_O and not has_U: return +1
-    if has_U and not has_O: return -1
-    return 0
 
-def _normalize_nc_content(df, endcuts, profile_type, dims_q, hand: int) -> Dict[str, Any]:
+def _normalize_nc_content_section(*,
+                                  df: pd.DataFrame | None,
+                                  endcuts: Dict[str, Any] | None,
+                                  tag: str,
+                                  dims: Tuple[float, float, float],   # (Lq,Hq,Wq)
+                                  hand: int,
+                                  xy_step: float,
+                                  d_step: float,
+                                  length_invariant: bool,
+                                  mirror_x_origin_canonical: bool = True) -> Dict[str, Any]:
     """
-    Build a compact, deterministic NC representation:
-    - Round coords/diameters to 0.1 mm
-    - Sort by (X,Y,face,type)
-    - Include endcuts in a stable form if provided
+    Build deterministic NC JSON and canonicalize over symmetries.
+    - Quantize coords (xy_step) and diameters (d_step)
+    - length_invariant: x_norm = min(X, L - X) (nearest end)
+      else:             x_norm = X (but compare mirrored variants)
+    - Canonicalization set:
+        * X-flip (origin at other end) if mirror_x_origin_canonical
+        * Y-mirror (swap O<->U) – helps when section is mirrored about web
+      Pick lexicographically minimal serialized JSON.
+    - Endcuts: collapse to a stable, side-agnostic sorted list so X-flip doesn’t change the key.
+    - Always include dims, tag, hand.
     """
-    round_c = lambda v: _quant(float(v), 0.1)
-    holes = []
+    Lq, Hq, Wq = dims
+
+    # ----- pull hole rows
+    features_raw: list[dict] = []
     if df is not None and len(df):
-        # Expect columns: ["Code","Diameter (mm)","X (mm)","Y (mm)", ...]
+        cols = {c.lower(): c for c in df.columns}
+        c_code = cols.get("code") or cols.get("face") or cols.get("side")
+        c_x    = cols.get("x (mm)") or cols.get("x")
+        c_y    = cols.get("y (mm)") or cols.get("y")
+        c_d    = cols.get("diameter (mm)") or cols.get("diameter")
+
         for row in df.itertuples(index=False):
-            face = getattr(row, "Code", "")
-            x = round_c(getattr(row, "X (mm)", 0.0))
-            y = round_c(getattr(row, "Y (mm)", 0.0))
-            d = _quant(getattr(row, "Diameter (mm)", 0.0), 0.01)
-            # Extend later for slots/countersinks if your DF has them
-            holes.append({"t": "hole", "f": face, "x": x, "y": y, "d": d})
-    holes.sort(key=lambda h: (h["f"], h["x"], h["y"], h["d"]))
+            features_raw.append({
+                "t": "hole",
+                "f": (getattr(row, c_code) if c_code else ""),
+                "x": _quant(float(getattr(row, c_x)) if c_x else 0.0, xy_step),
+                "y": _quant(float(getattr(row, c_y)) if c_y else 0.0, xy_step),
+                "d": _quant(float(getattr(row, c_d)) if c_d else 0.0, d_step),
+            })
 
-    ec_list = []
-    if endcuts:
-        # Accept either:
-        #  A) simple mapping of {name: float_angle_deg}
-        #  B) rich mapping of {name: {"type":..,"n":[...],"off":...}}
-        # Build a small stable representation with rounding.
-        def _round_endcut_value(val):
-            # val can be float or dict
-            if isinstance(val, (int, float)):
-                # store as angle degrees, quantized to 0.1
-                return {"angle_deg": _quant(float(val), 0.1)}
-            if isinstance(val, dict):
-                return {
-                    "type": val.get("type", ""),
-                    "n": [ _quant(float(v), 1e-3) for v in val.get("n", []) ],
-                    "off": _quant(float(val.get("off", 0.0)), 0.1),
+    # Endcuts as flip-invariant stable list
+    endcuts_norm = _endcuts_to_stable_list(endcuts)
+
+    # ----- produce symmetry variants
+    def _apply_ops(mirror_y: bool, flip_x: bool, nearest_end: bool) -> list[dict]:
+        out = []
+        for h in features_raw:
+            x = float(h["x"]); y = float(h["y"]); d = float(h["d"]); f = str(h["f"])
+            if flip_x and Lq > 0:
+                x = max(Lq - x, 0.0)
+            if mirror_y and Hq > 0:
+                y = max(Hq - y, 0.0)
+                # swap O<->U for open sections
+                f = _swap_face_for_y_mirror(f)
+            if nearest_end and Lq > 0:
+                x = min(x, max(Lq - x, 0.0))
+            out.append({"t":"hole","f":f,"x":_quant(x, xy_step),"y":_quant(y, xy_step),"d":_quant(d, d_step)})
+        return _sorted_features(out)
+
+    # Variant set:
+    #  - length_invariant=True → only Y mirror vs not (nearest-end already handles X)
+    #  - length_invariant=False → Cartesian of {no/yes Y} × {no/yes X flip}
+    variants = []
+    if length_invariant:
+        for my in (False, True):
+            feats = _apply_ops(mirror_y=my, flip_x=False, nearest_end=True)
+            payload = {
+                "v": 2, "route": "section", "profile": tag,
+                "dims": {"L": Lq, "H": Hq, "W": Wq},
+                "hand": hand, "features": feats, "endcuts": endcuts_norm
+            }
+            variants.append((json.dumps(payload, sort_keys=True, separators=(",",":")), payload))
+    else:
+        xs = (False, True) if mirror_x_origin_canonical else (False,)
+        for my in (False, True):
+            for fx in xs:
+                feats = _apply_ops(mirror_y=my, flip_x=fx, nearest_end=False)
+                payload = {
+                    "v": 2, "route": "section", "profile": tag,
+                    "dims": {"L": Lq, "H": Hq, "W": Wq},
+                    "hand": hand, "features": feats, "endcuts": endcuts_norm
                 }
-            # unknown type → stringify to stay robust
-            return {"value": str(val)}
+                variants.append((json.dumps(payload, sort_keys=True, separators=(",",":")), payload))
 
-        for k in sorted(endcuts.keys()):
-            ec_list.append({k: _round_endcut_value(endcuts[k])})
+    variants.sort(key=lambda t: t[0])
+    return variants[0][1]
 
-    Lq,Hq,Wq = dims_q
-    nc_json = {
-        "v": 1,
-        "profile": profile_type or "",
-        "dims": {"L": Lq, "H": Hq, "W": Wq},
-        "hand": hand,
-        "features": holes,
-        "endcuts": ec_list
-    }
-    return nc_json
 
 # ---------- PLATE ROUTE ----------
 
@@ -223,27 +348,27 @@ def fingerprint_plate(*,
     """
     Lq, Wq, Tq = _quant(L, quant_LW), _quant(W, quant_LW), _quant(T, quant_T)
 
-    # Family key — prefer a real outer-outline hash; else fall back to L/W dims.
-    if outline_hash:
-        fam_key = _md5_of_json({"route":"plate","outer": outline_hash})
-    else:
-        fam_key = _md5_of_json({"route":"plate","L": Lq, "W": Wq})  # fallback
+    fam_key = _md5_of_json({"route":"plate", "outer": outline_hash or "", "L": Lq, "W": Wq})
 
-    # Content key — MUST include internals
+    # STRICT content: full geometry + size + thickness
     if outline_full_hash:
-        content_key = _md5_of_json({"full": outline_full_hash, "T": Tq})
-        hand = 0  # optional: add hand inference later if you want mirror-sensitivity
-        return Fingerprint("plate", fam_key, content_key, hand, None,
-                           meta={"dims": (Lq, Wq, Tq)})
+        print(f"[fingerprint_plate] FULL used  full={outline_full_hash[:12]}  LWT={Lq}×{Wq}×{Tq}")
+        content_key = _md5_of_json({"full": outline_full_hash, "L": Lq, "W": Wq, "T": Tq})
+        return Fingerprint("plate", fam_key, content_key, 0, None,
+                           meta={"dims": (Lq, Wq, Tq), "fp_src": "full"})
 
-    # Fallback path (older placeholder) — build loops in code (outer+holes)
+    # Fallbacks (outer-only or computed loops)
+    if outline_hash:
+        print(f"[fingerprint_plate] OUTER used outer={outline_hash[:12]}  LWT={Lq}×{Wq}×{Tq}")
+        content_key = _md5_of_json({"outer": outline_hash, "L": Lq, "W": Wq, "T": Tq})
+        return Fingerprint("plate", fam_key, content_key, 0, None,
+                           meta={"dims": (Lq, Wq, Tq), "fp_src": "outer"})
+
+    print(f"[fingerprint_plate] FALLBACK used (no full/outer hash)  LWT={Lq}×{Wq}×{Tq}")
     outline_canon, hand = _canonicalize_plate_loops_and_hand(plate_shape, ax3, L, W)
-    fam_key_fallback = _md5_of_json({"route":"plate","outer": outline_canon["outer"]})
-    content_key_fallback = _md5_of_json({"loops": outline_canon, "T": Tq})
-    return Fingerprint("plate",
-                       fam_key if outline_hash else fam_key_fallback,
-                       content_key_fallback,
-                       hand, None, meta={"dims": (Lq, Wq, Tq)})
+    content_key = _md5_of_json({"loops": outline_canon, "L": Lq, "W": Wq, "T": Tq})
+    return Fingerprint("plate", fam_key, content_key, hand, None,
+                       meta={"dims": (Lq, Wq, Tq), "fp_src": "fallback"})
 
 def _canonicalize_plate_loops_and_hand(plate_shape, ax3, L, W):
     """
@@ -325,13 +450,13 @@ def fp_to_kwargs(fp: Fingerprint | None) -> dict:
             "fp_fallback_key": "",
             "fp_meta": "",
         }
-    import json
+
     return {
-        "fp_route": fp.route,
-        "fp_family_key": fp.family_key,
-        "fp_content_key": fp.content_key,
-        "fp_hand": fp.hand,
-        "fp_fallback_key": fp.fallback_key or "",
-        "fp_meta": json.dumps(fp.meta or {}),  # optional, but useful
+        "fp_route": str(getattr(fp, "route", "") or "").lower(),
+        "fp_family_key": getattr(fp, "family_key", "") or "",
+        "fp_content_key": getattr(fp, "content_key", "") or "",
+        "fp_hand": int(getattr(fp, "hand", 0) or 0),
+        "fp_fallback_key": getattr(fp, "fallback_key", "") or "",   # <- was missing
+        "fp_meta": json.dumps(getattr(fp, "meta", {}) or {}, separators=(",", ":"), ensure_ascii=False),
     }
 

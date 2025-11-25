@@ -19,7 +19,11 @@ from OCC.Extend.TopologyUtils import TopologyExplorer
 # ---------------------
 
 def _log(msg: str):
-    print(f"[ifc_exporter] {msg}")
+    printlog = False
+    if printlog is True:
+        print(f"[ifc_exporter] {msg}")
+    else:
+        pass
 
 # ---------------------
 # Helpers

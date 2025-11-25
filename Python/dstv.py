@@ -34,7 +34,9 @@ from pipeline.drilling import (generate_hole_projection_html)
 from pipeline.cad_out import (export_solid_to_brep, 
                               shape_to_thumbnail, 
                               export_solid_to_step,
-                              export_profile_dxf_with_pca, export_solid_to_stl
+                              export_profile_dxf_with_pca, 
+                              export_solid_to_stl,
+                              compute_dxf_fingerprint,
                               )
 from pipeline.plate_wrangling import (align_plate_to_xy_plane)
 from pipeline.report_builder import (record_solid,
@@ -61,7 +63,7 @@ from pipeline.vis_utils import save_yz_section_debug_png
 
 from pipeline.geometry_utils import compute_dstv_pose, _solid_centroid, _bbox_local
 
-from pipeline.fp_reports import generate_fp_reports, generate_fp_reports
+from pipeline.fp_reports import generate_fp_reports, generate_fp_reports, write_fingerprint_table_html
 
 # debug toggle
 DEBUG_SNAPSHOTS = True
@@ -285,28 +287,49 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
 
                     if is_plate:
                         object_type = "Plate"
+                        print("Plate Identified")
                         # record final dims from the plate aligner
                         obb_x = f"{length_mm:.2f}"
                         obb_y = f"{width_mm:.2f}"
                         obb_z = f"{thickness_mm:.2f}"
                         step_mass = f"{step_mass:.0f}"
 
-                        hash, dxf_file, dxf_thumb_file = export_profile_dxf_with_pca(
+                        dxf_hash, dxf_file, dxf_thumb_file = export_profile_dxf_with_pca(
                             final_aligned_solid,
                             f"{dxf_path}/{member_id}.dxf",
                             thumb_path=f"{dxf_thumb}/{member_id}",
                             samples_per_curve=32,
-                            fingerprint_tol=0.5,
+                            fingerprint_tol=0.5,   # tighter so small differences don’t collapse
                             ax3=ax3,
                             canonicalize=True
                         )
+
+                        hash = dxf_hash
                         shape_for_export = final_aligned_solid
                         thumb_frame      = ax3
 
+                        try:
+                            fp_full_strict = compute_dxf_fingerprint(dxf_file, tol=0.45, debug=False)
+                        except Exception as e:
+                            print(f"[plate-fp] strict failed: {e}")
+                            fp_full_strict = ""
+
+                        try:
+                            fp_full_fuzzy  = compute_dxf_fingerprint(dxf_file, tol=2.00, debug=False)
+                        except Exception as e:
+                            print(f"[plate-fp] fuzzy failed: {e}")
+                            fp_full_fuzzy = ""
+
                         fp = fingerprint_plate(
-                            plate_shape=final_aligned_solid, ax3=ax3,
-                            L=length_mm, W=width_mm, T=thickness_mm
-                            )
+                            plate_shape=final_aligned_solid,
+                            ax3=ax3,
+                            L=length_mm, W=width_mm, T=thickness_mm,
+                            outline_full_hash=(fp_full_strict or None),
+                            outline_hash=(fp_full_fuzzy or None),
+                        )
+
+                        print(f"[fp] {member_id} route={fp.route} src={(fp.meta or {}).get('fp_src')} "
+                            f"content={fp.content_key[:12]} family={fp.family_key[:12]}")
 
                     else:
                         # Not a section and plate guard vetoed → unknown
@@ -323,13 +346,16 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                                 pass  # keep it best-effort
                         shape_for_export = primary_aligned_shape
                         thumb_frame      = None
+                        extents_xyz = (float(obb_geom["aligned_extents"][0]),
+                        float(obb_geom["aligned_extents"][1]),
+                        float(obb_geom["aligned_extents"][2]))
+                        fp = fingerprint_unknown(shape=shape_for_export, extents_xyz=extents_xyz, quant_step=1.0)
 
                 # Always export something for investigation
                 try:
                     step_file = export_solid_to_step(shape_for_export, step_path, member_id)
                     stl_file = export_solid_to_stl(shape_for_export, stl_path, member_id)
                     brep_fingerprint, brep_file = export_solid_to_brep(shape_for_export, brep_path, member_id)
-                    fp = fingerprint_unknown(shape=shape_for_export, extents_xyz=obb_geom["aligned_extents"])
                     thumbnail_file = shape_to_thumbnail(
                         shape_for_export, thumb_path, member_id,
                         ax3=thumb_frame, camera="iso"
@@ -467,14 +493,19 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                 # Build fingerprint USING the NC1 hash
                 L, H, W = obb_geom["aligned_extents"]
                 fp = fingerprint_section(
-                    refined_shape=refined_shape,
-                    extents_xyz=(L, H, W),
+                    refined_shape=final_aligned_solid,
+                    extents_xyz=(length_mm, thickness_mm, width_mm),
                     section_area=section_area,
-                    profile_type=profile_match.get("Profile_type"),
-                    raw_df_holes=raw_df_holes,
-                    endcuts=web_cuts,
-                    nc1_hash=nc_hash
-                )
+                    profile_type=profile_match.get("Profile_type") if profile_match else None,
+                    raw_df_holes=raw_df_holes,                   # DataFrame or None
+                    endcuts=web_cuts,                            # dict or None
+                    web_thickness=profile_match.get("JSON",{}).get("web_thickness") if profile_match else None,
+                    flange_thickness=profile_match.get("JSON",{}).get("flange_thickness") if profile_match else None,
+                    root_radius=profile_match.get("JSON",{}).get("root_radius") if profile_match else None,
+                    toe_radius=profile_match.get("JSON",{}).get("toe_radius") if profile_match else None,
+                    dim_step=1.0, xy_step=0.1, d_step=0.1,   # tune if needed
+                    )
+
 
         except Exception as e:
             had_error = True
@@ -535,6 +566,7 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                     obj_type = object_type,
                     issues = issues,
                     hash = hash,
+                    **fp_to_kwargs(fp),
                     nc_hash = nc_hash,
                     dxf_thumb_path = dxf_thumb_file,
                     section_shape = section_shape,
@@ -552,13 +584,26 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
                     centroid_y = inv["centroid_y"],
                     centroid_z = inv["centroid_z"],
                     chirality = inv["chirality"],
-                    **fp_to_kwargs(fp),
                     )
 
     report_df = pd.DataFrame(report_rows)
     # print(report_df)
 
-   # Create HTML report
+    print("[debug] columns:", list(report_df.columns))
+
+    # What fp_route values do we actually have?
+    if "fp_route" in report_df.columns:
+        print("[debug] fp_route counts:\n", report_df["fp_route"].astype(str).value_counts(dropna=False).head(10))
+
+    # Show plates as recorded
+    plates = report_df.query("fp_route == 'plate'")[
+        ["name","obj_type","hash","fp_content_key","fp_family_key","fp_hand"]
+    ] if "fp_route" in report_df.columns else pd.DataFrame()
+    print(f"[plate-debug] rows={len(plates)}")
+    print(plates.head(12).to_string(index=False) if len(plates) else plates)
+
+
+    # Create HTML report
     df_to_html_with_images(report_df, report_path, project_number)
 
     # New: build both coarse + strict consolidated reports
@@ -566,10 +611,12 @@ def dstv_pipeline(step_file, root_model, project_number, matl_grade):
         report_df=report_df,
         output_dir=report_path,
         project_number=project_number,
-        split_hand_in_family=False  # set True if you want L/R split even in the coarse view
+        split_hand_in_family=True  # set True if you want L/R split even in the coarse view
     )
 
     print("Fingerprint reports:", reports)
+
+    write_fingerprint_table_html(report_df, report_path, project_number)
 
     # === Duplicate grouping using fingerprint fields ===
     # Strict duplicates (exact same manufactured content per route)
@@ -736,13 +783,36 @@ if __name__ == "__main__":
     #channel detect failure
     step0164 = "MEM-0164.step"
 
-    step_files = [step10268]
+    step10284 = "10284 LATEST FRAME + SUPP PLATES.step"
+
+    #10296 - OMEXOM
+    civ030 = "10296 CIV-030.step"
+    civ005 = "10296 CIV-005.step"
+    civ018 = "10296 CIV-018.step"
+    civ004 = "10296 CIV-004 Ass.step"
+    civ006 = "10296 CIV-006 Ass.step"
+    civ007 = "10296 CIV-007.step"
+    civ008 = "10296 CIV-008.step"
+    civ009 = "10296 CIV-009.step"
+    civ010 = "10296 CIV-010.step"
+    civ011 = "10296 CIV-011.step"
+    civ017 = "10296 CIV-017.step"
+
+    # step_files = [civ030, civ005, civ018, civ004, civ006, civ007, civ008, civ009, civ010, civ011, civ017]
+
+    #hercules internal
+
+    int01 = "C25001-MIN INTERNALS.step"
+
+    step_files = [int01]
+
+    # step_files = [step10268]  
 
     for step_file in step_files:
         # step_file = step02153b
         step_path = str(Path(home_path).joinpath(step_file))
 
-        project = "10268"
+        project = "10305"
         # project = "test"
         # project = "02086"
         grade = "S355"

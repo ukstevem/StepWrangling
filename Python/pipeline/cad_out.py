@@ -30,6 +30,14 @@ from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib
 from importlib import reload
 
+from typing import Union, Tuple, Optional, Iterable, List
+
+import hashlib, json, math
+import numpy as np
+from shapely.ops import unary_union, polygonize
+from shapely.geometry import LineString, Polygon
+from shapely import affinity
+
 # --- GLB export + XCAF (pythonocc) ---
 try:
     from OCC.Core.RWGltf import RWGltf_CafWriter
@@ -1226,84 +1234,214 @@ def export_solid_to_brep_and_fingerprint(
 # -------------------------
 # DXF fingerprint (Shapely)
 # -------------------------
-from shapely.geometry import LineString
-from shapely.ops import unary_union, polygonize
-from shapely import affinity
-from typing import Union, Tuple, Optional
 
-def compute_dxf_fingerprint(dxf_path: Union[Path, str], tol: float = 0.01) -> str:
+def compute_dxf_fingerprint(
+    dxf_path: Union[Path, str],
+    *,
+    tol: float = 0.50,               # 0.35–0.50 mm is a good robustness window
+    min_ring_area_mm2: float = 1.5,  # drop micro-slivers
+    debug: bool = False,
+) -> str:
     """
-    Quantize and hash a PCA/ax3-aligned DXF profile.
+    Hash the FULL DXF profile (outer + internal loops).
+    Invariants: translation, scale, 0/90/180/270° rotation, X-mirror, ring start, ring direction.
+    Works with LINE, LWPOLYLINE (bulges via virtual_entities), ARC, CIRCLE.
     """
     dxf_path = Path(dxf_path)
     doc = ezdxf.readfile(str(dxf_path))
-
     msp = doc.modelspace()
 
-    segs = []
+    segs: List[LineString] = []
 
-    # LINEs
-    for line in msp.query('LINE'):
-        start, end = line.dxf.start, line.dxf.end
-        if start is None or end is None:
-            continue
-        try:
-            x1, y1 = float(start[0]), float(start[1])
-            x2, y2 = float(end[0]), float(end[1])
-        except Exception:
-            continue
-        segs.append(LineString([(x1, y1), (x2, y2)]))
+    def _add_seg(x1, y1, x2, y2):
+        segs.append(LineString([(float(x1), float(y1)), (float(x2), float(y2))]))
 
-    # LWPOLYLINEs
-    for pl in msp.query('LWPOLYLINE'):
-        pts = list(pl.get_points('xy'))
-        if not pts:
-            continue
-        closed = bool(pl.closed)
-        for i in range(len(pts)-1):
-            (x1, y1), (x2, y2) = pts[i], pts[i+1]
-            segs.append(LineString([(float(x1), float(y1)), (float(x2), float(y2))]))
-        if closed and len(pts) > 2:
-            (x1, y1), (x2, y2) = pts[-1], pts[0]
-            segs.append(LineString([(float(x1), float(y1)), (float(x2), float(y2))]))
+    # --- LINE
+    for e in msp.query("LINE"):
+        s, t = e.dxf.start, e.dxf.end
+        if s is not None and t is not None:
+            _add_seg(s[0], s[1], t[0], t[1])
 
-    # ✅ CIRCLEs → chordize
-    N = 64  # chord resolution for circles
-    for ci in msp.query('CIRCLE'):
-        cx, cy = float(ci.dxf.center[0]), float(ci.dxf.center[1])
-        r = float(ci.dxf.radius)
+    # --- LWPOLYLINE → virtual_entities() (handles bulges as ARCs/LINEs)
+    for pl in msp.query("LWPOLYLINE"):
+        for ve in pl.virtual_entities():
+            if ve.dxftype() == "LINE":
+                s, t = ve.dxf.start, ve.dxf.end
+                _add_seg(s.x, s.y, t.x, t.y)
+            elif ve.dxftype() == "ARC":
+                cx, cy, r = ve.dxf.center.x, ve.dxf.center.y, float(ve.dxf.radius)
+                th0 = math.radians(float(ve.dxf.start_angle))
+                th1 = math.radians(float(ve.dxf.end_angle))
+                while th1 < th0:
+                    th1 += 2 * math.pi
+                steps = max(8, int(64 * (th1 - th0) / (2 * math.pi)))
+                for k in range(steps):
+                    t0 = th0 + (th1 - th0) * (k / steps)
+                    t1 = th0 + (th1 - th0) * ((k + 1) / steps)
+                    _add_seg(cx + r*math.cos(t0), cy + r*math.sin(t0),
+                             cx + r*math.cos(t1), cy + r*math.sin(t1))
+
+    # --- native ARC
+    for a in msp.query("ARC"):
+        cx, cy, r = a.dxf.center[0], a.dxf.center[1], float(a.dxf.radius)
+        th0 = math.radians(float(a.dxf.start_angle))
+        th1 = math.radians(float(a.dxf.end_angle))
+        while th1 < th0:
+            th1 += 2 * math.pi
+        steps = max(8, int(64 * (th1 - th0) / (2 * math.pi)))
+        for k in range(steps):
+            t0 = th0 + (th1 - th0) * (k / steps)
+            t1 = th0 + (th1 - th0) * ((k + 1) / steps)
+            _add_seg(cx + r*math.cos(t0), cy + r*math.sin(t0),
+                     cx + r*math.cos(t1), cy + r*math.sin(t1))
+
+    # --- CIRCLE
+    for ci in msp.query("CIRCLE"):
+        cx, cy, r = ci.dxf.center[0], ci.dxf.center[1], float(ci.dxf.radius)
+        N = 64
         for k in range(N):
-            a0 = 2*np.pi * k / N
-            a1 = 2*np.pi * (k+1) / N
-            x1, y1 = cx + r*np.cos(a0), cy + r*np.sin(a0)
-            x2, y2 = cx + r*np.cos(a1), cy + r*np.sin(a1)
-            segs.append(LineString([(x1, y1), (x2, y2)]))
+            a0 = 2*math.pi * k / N
+            a1 = 2*math.pi * (k+1) / N
+            _add_seg(cx + r*math.cos(a0), cy + r*math.sin(a0),
+                     cx + r*math.cos(a1), cy + r*math.sin(a1))
 
     if not segs:
-        raise RuntimeError("No LINE / LWPOLYLINE / CIRCLE geometry found in DXF for fingerprinting")
+        raise RuntimeError("No usable geometry found in DXF for fingerprinting")
 
-
+    # --- Build faces and fix topology
     merged = unary_union(segs)
-    polys = list(polygonize(merged))
-    if polys:
-        poly = polys[0]
-    else:
-        poly = merged.convex_hull
-        if poly.is_empty or not poly.exterior:
-            raise RuntimeError("Cannot derive a loop for fingerprinting")
+    faces = list(polygonize(merged))
+    if not faces:
+        hull = merged.convex_hull
+        if hull.is_empty or not hasattr(hull, "exterior"):
+            raise RuntimeError("Cannot derive loops for fingerprinting")
+        faces = [hull]
 
-    cx, cy = poly.centroid.x, poly.centroid.y
-    poly = affinity.translate(poly, xoff=-cx, yoff=-cy)
-    minx, miny, maxx, maxy = poly.bounds
-    max_dim = max(maxx - minx, maxy - miny)
-    if max_dim == 0:
-        raise RuntimeError("Degenerate profile with zero size")
-    factor = 1.0 / max_dim
-    poly = affinity.scale(poly, xfact=factor, yfact=factor, origin=(0,0))
+    U = unary_union(faces).buffer(0)  # Polygon or MultiPolygon
 
-    rounded = [(round(x/tol)*tol, round(y/tol)*tol) for x,y in poly.exterior.coords]
-    ring = LineString(rounded)
-    return hashlib.md5(ring.wkb).hexdigest()
+    # Helpers
+    def _ring_coords(ring) -> List[Tuple[float, float]]:
+        try:
+            return list(ring.coords)
+        except Exception:
+            try:
+                return list(ring)
+            except Exception:
+                return []
+
+    def _ring_area(ring) -> float:
+        coords = _ring_coords(ring)
+        if len(coords) < 3:
+            return 0.0
+        try:
+            return Polygon(coords).area
+        except Exception:
+            # Shoelace fallback
+            pts = coords[:]
+            if pts[0] != pts[-1]:
+                pts.append(pts[0])
+            s = 0.0
+            for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+                s += x0*y1 - x1*y0
+            return abs(s) * 0.5
+
+    def _collect_loops(geom):
+        loops = []
+        if geom.geom_type == "Polygon":
+            P = geom
+            if abs(P.area) >= min_ring_area_mm2:
+                loops.append(("outer", _ring_coords(P.exterior)))
+            for r in P.interiors:
+                if _ring_area(r) >= min_ring_area_mm2:
+                    loops.append(("hole", _ring_coords(r)))
+        else:  # MultiPolygon
+            for P in geom.geoms:
+                if abs(P.area) >= min_ring_area_mm2:
+                    loops.append(("outer", _ring_coords(P.exterior)))
+                for r in P.interiors:
+                    if _ring_area(r) >= min_ring_area_mm2:
+                        loops.append(("hole", _ring_coords(r)))
+        return loops
+
+    loops0 = _collect_loops(U)
+    if not loops0:
+        raise RuntimeError("No rings after cleaning")
+
+    # 8 transform candidates: rotations (0,90,180,270) × mirrorX(False/True)
+    R = [
+        ((1, 0, 0, 1), "R0"),
+        ((0,-1, 1, 0), "R90"),
+        ((-1,0, 0,-1), "R180"),
+        ((0, 1,-1, 0), "R270"),
+    ]
+    Mx = (-1, 0, 0, 1)
+
+    def _apply_mat(pt, mat):
+        x, y = float(pt[0]), float(pt[1])
+        a,b,c,d = mat
+        return (a*x + b*y, c*x + d*y)
+
+    def _norm_payload(loops, mat):
+        # transform all points
+        pts_all = [p for _, ring in loops for p in ring]
+        # compute bounds after transform for scale
+        xs, ys = [], []
+        for _, ring in loops:
+            for (x, y) in ring:
+                X, Y = _apply_mat((x, y), mat)
+                xs.append(X); ys.append(Y)
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        cx, cy = (minx + maxx)/2.0, (miny + maxy)/2.0
+        s = 1.0 / max(maxx - minx, maxy - miny, 1e-12)
+
+        def _canon_ring(ring):
+            q = []
+            for (x, y) in ring:
+                X, Y = _apply_mat((x, y), mat)
+                X = round((X - cx) * s / tol) * tol
+                Y = round((Y - cy) * s / tol) * tol
+                q.append((X, Y))
+            if len(q) > 1 and q[0] == q[-1]:
+                q = q[:-1]
+            if q:
+                # rotate start to lexicographically minimal
+                i0 = min(range(len(q)), key=lambda i: (q[i][0], q[i][1]))
+                q = q[i0:] + q[:i0]
+                # direction invariance
+                rev = list(reversed(q))
+                if rev < q:
+                    q = rev
+            return q
+
+        out = []
+        for tag, ring in loops:
+            cr = _canon_ring(ring)
+            if cr:
+                out.append((tag, cr))
+        # order: outers first, then longer rings first to stabilise, then lexicographic
+        out.sort(key=lambda t: (0 if t[0] == "outer" else 1, -len(t[1]), t[1]))
+        return json.dumps(out, separators=(",", ":"), ensure_ascii=False)
+
+    # build all 8 payloads and choose minimal
+    candidates = []
+    for (A, _rname) in R:
+        payload = _norm_payload(loops0, A)
+        candidates.append(payload)
+        # mirrorX ∘ R
+        Am = (Mx[0]*A[0] + Mx[1]*A[2], Mx[0]*A[1] + Mx[1]*A[3],
+              Mx[2]*A[0] + Mx[3]*A[2], Mx[2]*A[1] + Mx[3]*A[3])
+        payload_m = _norm_payload(loops0, Am)
+        candidates.append(payload_m)
+
+    best = min(candidates)
+    if debug:
+        uniq = {hashlib.md5(p.encode("utf-8")).hexdigest()[:12] for p in candidates}
+        print(f"[dxf-fp] candidates={len(candidates)} unique={len(uniq)} best={hashlib.md5(best.encode()).hexdigest()[:12]}")
+    return hashlib.md5(best.encode("utf-8")).hexdigest()
+
+
+
 
 # -------------------------
 # 2D axes heuristic
@@ -1763,163 +1901,3 @@ def export_solid_to_stl(
         raise RuntimeError("Failed to write STL")
 
     return str(stl_path)
-
-# # -------------------------
-# # Manifest writer (viewer-friendly)
-# # -------------------------
-# from pathlib import Path
-# import json
-# import shutil
-
-# def _ensure_mat4(T):
-#     # Accept list of 16 or nested 4x4; return nested 4x4
-#     if isinstance(T, (list, tuple)) and len(T) == 16:
-#         return [list(T[0:4]), list(T[4:8]), list(T[8:12]), list(T[12:16])]
-#     if isinstance(T, (list, tuple)) and len(T) == 4 and all(len(r) == 4 for r in T):
-#         return [list(r) for r in T]
-#     raise ValueError(f"Bad transform, expected 16 elems or 4x4: {T}")
-
-# def _copy_if(src: Path, dst: Path):
-#     dst.parent.mkdir(parents=True, exist_ok=True)
-#     if src.exists():
-#         if str(src.resolve()) != str(dst.resolve()):
-#             shutil.copyfile(str(src), str(dst))
-#         return True
-#     return False
-
-# def write_viewer_manifest(
-#     pack_root: str | Path,
-#     df_unique,
-#     df_instances,
-#     *,
-#     project_number: str | None = None,
-#     units: str = "MM",
-#     # how to find per-part GLBs:
-#     unique_part_id_col="part_id",
-#     unique_name_col="name",
-#     unique_glb_col="glb_path",          # if not given, we’ll derive from step and rename
-#     unique_step_col="step_path",         # used as a fallback to deduce where the GLB should be
-#     # instance mapping:
-#     inst_part_id_col="part_id",
-#     inst_name_col="name",
-#     inst_parent_col="parent_asm",        # optional
-#     inst_T_col="T",
-#     inst_id_col="instance_id",           # optional
-#     # assemblies (optional): pass a DataFrame or leave None
-#     df_assemblies=None,                  # expects columns: asm_id, name, parent_id, matrix
-#     # mesh inlining (optional):
-#     inline_mesh=False,                   # if True, embed vertices/triangles (and metadata) for each part
-#     inline_vertices_col="vertices",      # Nx3 floats
-#     inline_triangles_col="triangles",    # Mx3 ints
-#     inline_props_cols=None,              # list of property column names to carry into part dict
-# ):
-#     """
-#     Writes: <pack_root>/manifest.json and copies per-part GLBs into <pack_root>/defs/<part_id>.glb
-#     Shapes supported:
-#       - Simple (no assemblies)
-#       - With assemblies
-#       - Inline mesh & metadata (optional)
-#     """
-#     pack_root = Path(pack_root)
-#     defs_dir = pack_root / "defs"
-#     defs_dir.mkdir(parents=True, exist_ok=True)
-
-#     # ---- Build parts entries
-#     parts_out = []
-#     partid_to_rel = {}
-
-#     for _, row in df_unique.iterrows():
-#         pid = str(row[unique_part_id_col])
-
-#         # where is the GLB coming from?
-#         glb_src = None
-#         if unique_glb_col in row and row[unique_glb_col]:
-#             glb_src = Path(str(row[unique_glb_col]))
-#         elif unique_step_col in row and row[unique_step_col]:
-#             # convention: your pipeline names "<filename>.glb" near the step
-#             step_src = Path(str(row[unique_step_col]))
-#             # Try sibling with same stem:
-#             guess = step_src.with_suffix(".glb")
-#             if guess.exists():
-#                 glb_src = guess
-#         # destination inside defs/
-#         glb_dst = defs_dir / f"{pid}.glb"
-#         if glb_src and _copy_if(glb_src, glb_dst):
-#             glb_rel = f"defs/{pid}.glb"
-#         else:
-#             glb_rel = None  # may be missing if inline_mesh
-
-#         part_rec = {"def_id": f"hash:{pid}"}
-
-#         if inline_mesh:
-#             # Inline vertices/triangles if present
-#             verts = row.get(inline_vertices_col)
-#             tris  = row.get(inline_triangles_col)
-#             if verts is not None and tris is not None:
-#                 # Make sure they are basic lists (not numpy)
-#                 V = [[float(x), float(y), float(z)] for (x, y, z) in verts]
-#                 I = [[int(a), int(b), int(c)] for (a, b, c) in tris]
-#                 part_rec["vertices"]  = V
-#                 part_rec["triangles"] = I
-#             else:
-#                 # If inline requested but missing mesh, leave a pointer if we have it
-#                 if glb_rel:
-#                     part_rec["glb_url"] = glb_rel
-#         else:
-#             if glb_rel:
-#                 part_rec["glb_url"] = glb_rel
-
-#         # Optional extra properties on the part
-#         if inline_props_cols:
-#             for c in inline_props_cols:
-#                 if c in row and row[c] is not None:
-#                     part_rec[c] = row[c]
-
-#         parts_out.append(part_rec)
-#         partid_to_rel[pid] = glb_rel
-
-#     # ---- Build instances
-#     instances_out = []
-#     for _, row in df_instances.iterrows():
-#         pid = str(row[inst_part_id_col])
-#         name = str(row[inst_name_col]) if inst_name_col and row.get(inst_name_col) is not None else pid
-#         occ_id = str(row[inst_id_col]) if inst_id_col and row.get(inst_id_col) is not None else f"occ:{name}"
-#         T = _ensure_mat4(row[inst_T_col])
-
-#         rec = {
-#             "occ_id": occ_id,
-#             "def_id": f"hash:{pid}",
-#             "name": name,
-#             "matrix": T,
-#         }
-#         if inst_parent_col and row.get(inst_parent_col) is not None:
-#             rec["parent_id"] = str(row[inst_parent_col])
-#         instances_out.append(rec)
-
-#     # ---- Assemblies (optional)
-#     assemblies_out = None
-#     if df_assemblies is not None:
-#         assemblies_out = []
-#         for _, row in df_assemblies.iterrows():
-#             a = {
-#                 "asm_id":   str(row.get("asm_id") or row.get("id") or row.get("name")),
-#                 "name":     str(row.get("name") or row.get("asm_id")),
-#                 "parent_id": row.get("parent_id"),
-#                 "matrix": _ensure_mat4(row.get("matrix") or [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
-#             }
-#             assemblies_out.append(a)
-
-#     # ---- Manifest root
-#     mani = {
-#         "version": "1.0",
-#         "units": units,
-#         "parts": parts_out,
-#         "instances": instances_out,
-#     }
-#     if project_number:
-#         mani["project_number"] = project_number
-#     if assemblies_out:
-#         mani["assemblies"] = assemblies_out
-
-#     (pack_root / "manifest.json").write_text(json.dumps(mani, indent=2), encoding="utf-8")
-#     return pack_root / "manifest.json"
